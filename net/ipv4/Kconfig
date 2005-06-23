@@ -470,6 +470,7 @@ config TCP_CONG_BIC
 	increase provides TCP friendliness.
 	See http://www.csc.ncsu.edu/faculty/rhee/export/bitcp/
 
+
 config TCP_CONG_CUBIC
 	tristate "CUBIC TCP"
 	default y
@@ -480,6 +481,7 @@ config TCP_CONG_CUBIC
 
 config TCP_CONG_WESTWOOD
 	tristate "TCP Westwood+"
+	depends on INET
 	default m
 	---help---
 	TCP Westwood+ is a sender-side only modification of the TCP Reno
@@ -491,6 +493,7 @@ config TCP_CONG_WESTWOOD
 	account the bandwidth used  at the time congestion is experienced.
 	TCP Westwood+ significantly increases fairness wrt TCP Reno in
 	wired networks and throughput over wireless links.
+
 
 config TCP_CONG_HTCP
         tristate "H-TCP"
@@ -599,6 +602,7 @@ config TCP_CONG_ILLINOIS
 	high speed long delay links. It uses round-trip-time to
 	adjust the alpha and beta parameters to achieve a higher average
 	throughput and maintain fairness.
+endmenu
 
 	For further details see:
 	  http://www.ews.uiuc.edu/~shaoliu/tcpillinois/index.html
