@@ -10,16 +10,7 @@
  * published by the Free Software Foundation; either version 2 of the
  * License or (at your optional) any later version of the license.
  */
-//changes
-#ifndef _ASM_GENERIC_DMA_CONTIGUOUS_H
-#define _ASM_GENERIC_DMA_CONTIGUOUS_H
 
-#include <linux/types.h>
-
-static inline void dma_contiguous_early_fixup(phys_addr_t base, unsigned long size) { }
-
-#endif
-//end
 #define pr_fmt(fmt) "cma: " fmt
 
 #ifdef CONFIG_CMA_DEBUG
