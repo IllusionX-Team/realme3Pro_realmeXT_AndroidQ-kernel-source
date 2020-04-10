@@ -10,6 +10,8 @@ obj-y				+= bus/
 
 obj-$(CONFIG_GENERIC_PHY)	+= phy/
 
+obj-$(CONFIG_VSERVICES_SUPPORT)	+= vservices/
+
 # GPIO must come after pinctrl as gpios may need to mux pins etc
 obj-$(CONFIG_PINCTRL)		+= pinctrl/
 obj-$(CONFIG_GPIOLIB)		+= gpio/
@@ -80,6 +82,7 @@ obj-$(CONFIG_TARGET_CORE)	+= target/
 obj-$(CONFIG_MTD)		+= mtd/
 obj-$(CONFIG_SPI)		+= spi/
 obj-$(CONFIG_SPMI)		+= spmi/
+obj-$(CONFIG_SLIMBUS)		+= slimbus/
 obj-$(CONFIG_HSI)		+= hsi/
 obj-y				+= net/
 obj-$(CONFIG_ATM)		+= atm/
@@ -174,4 +177,7 @@ obj-y				+= hwtracing/intel_th/
 obj-$(CONFIG_STM)		+= hwtracing/stm/
 obj-$(CONFIG_ANDROID)		+= android/
 obj-$(CONFIG_NVMEM)		+= nvmem/
+obj-$(CONFIG_ESOC)              += esoc/
 obj-$(CONFIG_FPGA)		+= fpga/
+obj-$(CONFIG_SENSORS_SSC)		+= sensors/
+obj-$(CONFIG_TEE)		+= tee/
