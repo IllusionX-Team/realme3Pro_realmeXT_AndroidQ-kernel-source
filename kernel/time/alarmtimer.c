@@ -26,19 +26,6 @@
 #include <linux/workqueue.h>
 #include <linux/freezer.h>
 
-
-#ifdef VENDOR_EDIT
-//Fanhong.Kong@ProDrv.CHG,modified 2016.08.13 for 2 minutes may not power up
-#define ALARM_MINIMUM 120
-#define ALARM_DELTA 60
-
-static atomic_t alarm_atomic = ATOMIC_INIT(0);
-static atomic_t alarm_sleep_busy_atomic = ATOMIC_INIT(0);
-extern u64 alarm_count;
-extern u64 wakeup_source_count_rtc;
-extern enum alarmtimer_restart	(*net_alarm_func)(struct alarm *, ktime_t now);
-#endif /*VENDOR_EDIT*/
-
 /**
  * struct alarm_base - Alarm timer bases
  * @lock:		Lock for syncrhonized access to the base
@@ -65,18 +52,6 @@ static struct rtc_timer		rtctimer;
 static struct rtc_device	*rtcdev;
 static DEFINE_SPINLOCK(rtcdev_lock);
 
-static void alarmtimer_triggered_func(void *p)
-{
-	struct rtc_device *rtc = rtcdev;
-
-	if (!(rtc->irq_data & RTC_AF))
-		return;
-	__pm_wakeup_event(ws, 2 * MSEC_PER_SEC);
-}
-
-static struct rtc_task alarmtimer_rtc_task = {
-	.func = alarmtimer_triggered_func
-};
 /**
  * alarmtimer_get_rtcdev - Return selected rtcdevice
  *
@@ -87,7 +62,7 @@ static struct rtc_task alarmtimer_rtc_task = {
 struct rtc_device *alarmtimer_get_rtcdev(void)
 {
 	unsigned long flags;
-	struct rtc_device *ret = NULL;
+	struct rtc_device *ret;
 
 	spin_lock_irqsave(&rtcdev_lock, flags);
 	ret = rtcdev;
@@ -101,36 +76,24 @@ static int alarmtimer_rtc_add_device(struct device *dev,
 				struct class_interface *class_intf)
 {
 	unsigned long flags;
-	int err = 0;
 	struct rtc_device *rtc = to_rtc_device(dev);
+
 	if (rtcdev)
 		return -EBUSY;
+
 	if (!rtc->ops->set_alarm)
+		return -1;
+	if (!device_may_wakeup(rtc->dev.parent))
 		return -1;
 
 	spin_lock_irqsave(&rtcdev_lock, flags);
 	if (!rtcdev) {
-		err = rtc_irq_register(rtc, &alarmtimer_rtc_task);
-		if (err)
-			goto rtc_irq_reg_err;
 		rtcdev = rtc;
 		/* hold a reference so it doesn't go away */
 		get_device(dev);
 	}
-
-rtc_irq_reg_err:
 	spin_unlock_irqrestore(&rtcdev_lock, flags);
-	return err;
-
-}
-
-static void alarmtimer_rtc_remove_device(struct device *dev,
-				struct class_interface *class_intf)
-{
-	if (rtcdev && dev == &rtcdev->dev) {
-		rtc_irq_unregister(rtcdev, &alarmtimer_rtc_task);
-		rtcdev = NULL;
-	}
+	return 0;
 }
 
 static inline void alarmtimer_rtc_timer_init(void)
@@ -140,7 +103,6 @@ static inline void alarmtimer_rtc_timer_init(void)
 
 static struct class_interface alarmtimer_rtc_interface = {
 	.add_dev = &alarmtimer_rtc_add_device,
-	.remove_dev = &alarmtimer_rtc_remove_device,
 };
 
 static int alarmtimer_rtc_interface_setup(void)
@@ -221,30 +183,6 @@ static enum hrtimer_restart alarmtimer_fired(struct hrtimer *timer)
 	alarmtimer_dequeue(base, alarm);
 	spin_unlock_irqrestore(&base->lock, flags);
 
-#ifdef VENDOR_EDIT
-	//Nanwei.Deng@BSP.Power.Basic 2018/04/28 add for count alarm times
-	if (alarm->type == ALARM_REALTIME || alarm->type == ALARM_BOOTTIME) {
-		if(!((alarm->function) && (alarm->function == net_alarm_func)))    //Yunqing.Zeng@BSP.Power.Basic 2017/12/12 add for filter net alarm
-			alarm_count++;
-
-		if(atomic_read(&alarm_atomic) || atomic_read(&alarm_sleep_busy_atomic)) {
-			if(!((alarm->function) && (alarm->function == net_alarm_func))) //Yunqing.Zeng@BSP.Power.Basic 2017/12/12 add for filter net alarm
-				wakeup_source_count_rtc++;
-
-			if(atomic_read(&alarm_sleep_busy_atomic)) {
-				atomic_set(&alarm_sleep_busy_atomic, 0);
-			}
-			if (alarm->function) {
-				pr_info("%s.: type=%d, count=%lld, wakeup count=%lld, func=%pf\n", __func__, alarm->type, alarm_count, wakeup_source_count_rtc, alarm->function); //log diff, better for log filter
-			}
-		} else {
-			if (alarm->function) {
-				//pr_info("%s : type=%d, count=%lld, wakeup count=%lld, func=%pf\n", __func__, alarm->type, alarm_count, wakeup_source_count_rtc, alarm->function);
-			}
-		}
-	}
-#endif /*VENDOR_EDIT*/
-
 	if (alarm->function)
 		restart = alarm->function(alarm, base->gettime());
 
@@ -291,10 +229,6 @@ static int alarmtimer_suspend(struct device *dev)
 	min = freezer_delta;
 	freezer_delta = ktime_set(0, 0);
 	spin_unlock_irqrestore(&freezer_delta_lock, flags);
-    #ifdef VENDOR_EDIT
-	//Nanwei.Deng@Kernel.Driver, 2018/04/28,add for count alarm times
-	atomic_set(&alarm_atomic, 1);
-	#endif /*VENDOR_EDIT*/
 
 	rtc = alarmtimer_get_rtcdev();
 	/* If we have no rtcdev, just return */
@@ -321,11 +255,6 @@ static int alarmtimer_suspend(struct device *dev)
 
 	if (ktime_to_ns(min) < 2 * NSEC_PER_SEC) {
 		__pm_wakeup_event(ws, 2 * MSEC_PER_SEC);
-        #ifdef VENDOR_EDIT
-		//Nanwei.Deng@BSP.Power.Basic 2018/04/28 add for count alarm times
-		atomic_set(&alarm_atomic, 0);
-		atomic_set(&alarm_sleep_busy_atomic, 1);
-		#endif /* VENDOR_EDIT */
 		return -EBUSY;
 	}
 
@@ -345,10 +274,6 @@ static int alarmtimer_suspend(struct device *dev)
 static int alarmtimer_resume(struct device *dev)
 {
 	struct rtc_device *rtc;
-    #ifdef VENDOR_EDIT
-	//Nanwei.Deng@Kernel.Driver, 2018/04/28,add for count alarm times
-	atomic_set(&alarm_atomic, 0);
-	#endif /*VENDOR_EDIT*/
 
 	rtc = alarmtimer_get_rtcdev();
 	if (rtc)
@@ -398,10 +323,6 @@ void alarm_init(struct alarm *alarm, enum alarmtimer_type type,
 	alarm->timer.function = alarmtimer_fired;
 	alarm->function = function;
 	alarm->type = type;
-	if (type >= ALARM_NUMTYPE) {
-		/* use ALARM_BOOTTIME as the default */
-		alarm->type = ALARM_BOOTTIME;
-	}
 	alarm->state = ALARMTIMER_STATE_INACTIVE;
 }
 EXPORT_SYMBOL_GPL(alarm_init);
@@ -623,7 +544,7 @@ static int alarm_timer_create(struct k_itimer *new_timer)
 	enum  alarmtimer_type type;
 
 	if (!alarmtimer_get_rtcdev())
-		return -ENOTSUPP;
+		return -EOPNOTSUPP;
 
 	if (!capable(CAP_WAKE_ALARM))
 		return -EPERM;
@@ -665,7 +586,7 @@ static void alarm_timer_get(struct k_itimer *timr,
 static int alarm_timer_del(struct k_itimer *timr)
 {
 	if (!rtcdev)
-		return -ENOTSUPP;
+		return -EOPNOTSUPP;
 
 	if (alarm_try_to_cancel(&timr->it.alarm.alarmtimer) < 0)
 		return TIMER_RETRY;
@@ -689,7 +610,7 @@ static int alarm_timer_set(struct k_itimer *timr, int flags,
 	ktime_t exp;
 
 	if (!rtcdev)
-		return -ENOTSUPP;
+		return -EOPNOTSUPP;
 
 	if (flags & ~TIMER_ABSTIME)
 		return -EINVAL;
@@ -851,7 +772,7 @@ static int alarm_timer_nsleep(const clockid_t which_clock, int flags,
 	struct restart_block *restart;
 
 	if (!alarmtimer_get_rtcdev())
-		return -ENOTSUPP;
+		return -EOPNOTSUPP;
 
 	if (flags & ~TIMER_ABSTIME)
 		return -EINVAL;

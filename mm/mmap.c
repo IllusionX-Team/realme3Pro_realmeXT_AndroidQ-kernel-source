@@ -44,20 +44,6 @@
 #include <linux/userfaultfd_k.h>
 #include <linux/moduleparam.h>
 #include <linux/pkeys.h>
-#include <linux/oom.h>
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-/* Kui.Zhang@TEC.Kernel.Performance, 2019/03/13
- * collect reserve area used count
- */
-#include <linux/resmap_account.h>
-#endif
-#if defined(VENDOR_EDIT) && defined(CONFIG_OPPO_HEALTHINFO)
-/* Kui.Zhang@TEC.Kernel.Performance, 2019/06/06
- * collect svm_oom log
- */
-#include <soc/oppo/oppo_healthinfo.h>
-#endif /*VENDOR_EDIT*/
-
 
 #include <asm/uaccess.h>
 #include <asm/cacheflush.h>
@@ -101,12 +87,6 @@ static void unmap_region(struct mm_struct *mm,
  * MAP_PRIVATE	r: (no) no	r: (yes) yes	r: (no) yes	r: (no) yes
  *		w: (no) no	w: (no) no	w: (copy) copy	w: (no) no
  *		x: (no) no	x: (no) yes	x: (no) yes	x: (yes) yes
- *
- * On arm64, PROT_EXEC has the following behaviour for both MAP_SHARED and
- * MAP_PRIVATE:
- *								r: (no) no
- *								w: (no) no
- *								x: (yes) yes
  */
 pgprot_t protection_map[16] = {
 	__P000, __P001, __P010, __P011, __P100, __P101, __P110, __P111,
@@ -173,27 +153,6 @@ void unlink_file_vma(struct vm_area_struct *vma)
 	}
 }
 
-static void __free_vma(struct vm_area_struct *vma)
-{
-	if (vma->vm_file)
-		fput(vma->vm_file);
-	mpol_put(vma_policy(vma));
-	kmem_cache_free(vm_area_cachep, vma);
-}
-
-#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
-void put_vma(struct vm_area_struct *vma)
-{
-	if (atomic_dec_and_test(&vma->vm_ref_count))
-		__free_vma(vma);
-}
-#else
-static inline void put_vma(struct vm_area_struct *vma)
-{
-	__free_vma(vma);
-}
-#endif
-
 /*
  * Close a vm structure and free it, returning the next.
  */
@@ -204,7 +163,10 @@ static struct vm_area_struct *remove_vma(struct vm_area_struct *vma)
 	might_sleep();
 	if (vma->vm_ops && vma->vm_ops->close)
 		vma->vm_ops->close(vma);
-	put_vma(vma);
+	if (vma->vm_file)
+		fput(vma->vm_file);
+	mpol_put(vma_policy(vma));
+	kmem_cache_free(vm_area_cachep, vma);
 	return next;
 }
 
@@ -422,14 +384,6 @@ static void validate_mm(struct mm_struct *mm)
 #define validate_mm(mm) do { } while (0)
 #endif
 
-#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
-#define mm_rb_write_lock(mm)	write_lock(&(mm)->mm_rb_lock)
-#define mm_rb_write_unlock(mm)	write_unlock(&(mm)->mm_rb_lock)
-#else
-#define mm_rb_write_lock(mm)	do { } while (0)
-#define mm_rb_write_unlock(mm)	do { } while (0)
-#endif /* CONFIG_SPECULATIVE_PAGE_FAULT */
-
 RB_DECLARE_CALLBACKS(static, vma_gap_callbacks, struct vm_area_struct, vm_rb,
 		     unsigned long, rb_subtree_gap, vma_compute_subtree_gap)
 
@@ -448,61 +402,26 @@ static void vma_gap_update(struct vm_area_struct *vma)
 }
 
 static inline void vma_rb_insert(struct vm_area_struct *vma,
-				 struct mm_struct *mm)
+				 struct rb_root *root)
 {
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@TEC.Kernel.Performance, 2019/03/13
-	 * is it alloc from reserved area
-	 */
-	struct rb_root *root;
-
-	if (BACKUP_ALLOC_FLAG(vma->vm_flags))
-		root = &mm->reserve_mm_rb;
-	else
-		root = &mm->mm_rb;
-#else
-	struct rb_root *root = &mm->mm_rb;
-#endif
-
 	/* All rb_subtree_gap values must be consistent prior to insertion */
 	validate_mm_rb(root, NULL);
 
 	rb_insert_augmented(&vma->vm_rb, root, &vma_gap_callbacks);
 }
 
-static void __vma_rb_erase(struct vm_area_struct *vma, struct mm_struct *mm)
+static void __vma_rb_erase(struct vm_area_struct *vma, struct rb_root *root)
 {
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * reserved area use
-	 */
-	struct rb_root *root;
-
-	if (BACKUP_ALLOC_FLAG(vma->vm_flags))
-		root = &mm->reserve_mm_rb;
-	else
-		root = &mm->mm_rb;
-#else
-	struct rb_root *root = &mm->mm_rb;
-#endif
 	/*
 	 * Note rb_erase_augmented is a fairly large inline function,
 	 * so make sure we instantiate it only once with our desired
 	 * augmented rbtree callbacks.
 	 */
-	mm_rb_write_lock(mm);
 	rb_erase_augmented(&vma->vm_rb, root, &vma_gap_callbacks);
-	mm_rb_write_unlock(mm); /* wmb */
-
-	/*
-	 * Ensure the removal is complete before clearing the node.
-	 * Matched by vma_has_changed()/handle_speculative_fault().
-	 */
-	RB_CLEAR_NODE(&vma->vm_rb);
 }
 
 static __always_inline void vma_rb_erase_ignore(struct vm_area_struct *vma,
-						struct mm_struct *mm,
+						struct rb_root *root,
 						struct vm_area_struct *ignore)
 {
 	/*
@@ -510,31 +429,21 @@ static __always_inline void vma_rb_erase_ignore(struct vm_area_struct *vma,
 	 * with the possible exception of the "next" vma being erased if
 	 * next->vm_start was reduced.
 	 */
-	validate_mm_rb(&mm->mm_rb, ignore);
+	validate_mm_rb(root, ignore);
 
-	__vma_rb_erase(vma, mm);
+	__vma_rb_erase(vma, root);
 }
 
 static __always_inline void vma_rb_erase(struct vm_area_struct *vma,
-					 struct mm_struct *mm)
+					 struct rb_root *root)
 {
 	/*
 	 * All rb_subtree_gap values must be consistent prior to erase,
 	 * with the possible exception of the vma being erased.
 	 */
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * reserved area use
-	 */
-	if (BACKUP_ALLOC_FLAG(vma->vm_flags))
-		validate_mm_rb(&mm->reserve_mm_rb, vma);
-	else
-		validate_mm_rb(&mm->mm_rb, vma);
-#else
-	validate_mm_rb(&mm->mm_rb, vma);
-#endif
+	validate_mm_rb(root, vma);
 
-	__vma_rb_erase(vma, mm);
+	__vma_rb_erase(vma, root);
 }
 
 /*
@@ -575,17 +484,7 @@ static int find_vma_links(struct mm_struct *mm, unsigned long addr,
 {
 	struct rb_node **__rb_link, *__rb_parent, *rb_prev;
 
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@TEC.Kernel.Performance, 2019/03/13
-	 * collect reserve area used count
-	 */
-	if (is_backed_addr(mm, addr, end))
-		__rb_link = &mm->reserve_mm_rb.rb_node;
-	else
-		__rb_link = &mm->mm_rb.rb_node;
-#else
 	__rb_link = &mm->mm_rb.rb_node;
-#endif
 	rb_prev = __rb_parent = NULL;
 
 	while (*__rb_link) {
@@ -647,20 +546,8 @@ void __vma_link_rb(struct mm_struct *mm, struct vm_area_struct *vma,
 	/* Update tracking information for the gap following the new vma. */
 	if (vma->vm_next)
 		vma_gap_update(vma->vm_next);
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@TEC.Kernel.Performance, 2019/03/13
-	 * is it alloc from reserved area
-	 */
-	else {
-		if (BACKUP_ALLOC_FLAG(vma->vm_flags))
-			mm->reserve_highest_vm_end = vm_end_gap(vma);
-		else
-			mm->highest_vm_end = vm_end_gap(vma);
-	}
-#else
 	else
 		mm->highest_vm_end = vm_end_gap(vma);
-#endif
 
 	/*
 	 * vma->vm_prev wasn't known when we followed the rbtree to find the
@@ -671,12 +558,10 @@ void __vma_link_rb(struct mm_struct *mm, struct vm_area_struct *vma,
 	 * immediately update the gap to the correct value. Finally we
 	 * rebalance the rbtree after all augmented values have been set.
 	 */
-	mm_rb_write_lock(mm);
 	rb_link_node(&vma->vm_rb, rb_parent, rb_link);
 	vma->rb_subtree_gap = 0;
 	vma_gap_update(vma);
-	vma_rb_insert(vma, mm);
-	mm_rb_write_unlock(mm);
+	vma_rb_insert(vma, &mm->mm_rb);
 }
 
 static void __vma_link_file(struct vm_area_struct *vma)
@@ -724,17 +609,7 @@ static void vma_link(struct mm_struct *mm, struct vm_area_struct *vma,
 	if (mapping)
 		i_mmap_unlock_write(mapping);
 
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@TEC.Kernel.Performance, 2019/03/13
-	 * is it alloc from reserved area
-	 */
-	if (BACKUP_ALLOC_FLAG(vma->vm_flags))
-		mm->reserve_map_count++;
-	else
-		mm->map_count++;
-#else
 	mm->map_count++;
-#endif
 	validate_mm(mm);
 }
 
@@ -751,17 +626,7 @@ static void __insert_vm_struct(struct mm_struct *mm, struct vm_area_struct *vma)
 			   &prev, &rb_link, &rb_parent))
 		BUG();
 	__vma_link(mm, vma, prev, rb_link, rb_parent);
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@TEC.Kernel.Performance, 2019/03/13
-	 * is it alloc from reserved area
-	 */
-	if (BACKUP_ALLOC_FLAG(vma->vm_flags))
-		mm->reserve_map_count++;
-	else
-		mm->map_count++;
-#else
 	mm->map_count++;
-#endif
 }
 
 static __always_inline void __vma_unlink_common(struct mm_struct *mm,
@@ -772,7 +637,7 @@ static __always_inline void __vma_unlink_common(struct mm_struct *mm,
 {
 	struct vm_area_struct *next;
 
-	vma_rb_erase_ignore(vma, mm, ignore);
+	vma_rb_erase_ignore(vma, &mm->mm_rb, ignore);
 	next = vma->vm_next;
 	if (has_prev)
 		prev->vm_next = next;
@@ -806,7 +671,7 @@ static inline void __vma_unlink_prev(struct mm_struct *mm,
  */
 int __vma_adjust(struct vm_area_struct *vma, unsigned long start,
 	unsigned long end, pgoff_t pgoff, struct vm_area_struct *insert,
-	struct vm_area_struct *expand, bool keep_locked)
+	struct vm_area_struct *expand)
 {
 	struct mm_struct *mm = vma->vm_mm;
 	struct vm_area_struct *next = vma->vm_next, *orig_vma = vma;
@@ -817,30 +682,6 @@ int __vma_adjust(struct vm_area_struct *vma, unsigned long start,
 	bool start_changed = false, end_changed = false;
 	long adjust_next = 0;
 	int remove_next = 0;
-
-	/*
-	 * Why using vm_raw_write*() functions here to avoid lockdep's warning ?
-	 *
-	 * Locked is complaining about a theoretical lock dependency, involving
-	 * 3 locks:
-	 *   mapping->i_mmap_rwsem --> vma->vm_sequence --> fs_reclaim
-	 *
-	 * Here are the major path leading to this dependency :
-	 *  1. __vma_adjust() mmap_sem  -> vm_sequence -> i_mmap_rwsem
-	 *  2. move_vmap() mmap_sem -> vm_sequence -> fs_reclaim
-	 *  3. __alloc_pages_nodemask() fs_reclaim -> i_mmap_rwsem
-	 *  4. unmap_mapping_range() i_mmap_rwsem -> vm_sequence
-	 *
-	 * So there is no way to solve this easily, especially because in
-	 * unmap_mapping_range() the i_mmap_rwsem is grab while the impacted
-	 * VMAs are not yet known.
-	 * However, the way the vm_seq is used is guarantying that we will
-	 * never block on it since we just check for its value and never wait
-	 * for it to move, see vma_has_changed() and handle_speculative_fault().
-	 */
-	vm_raw_write_begin(vma);
-	if (next)
-		vm_raw_write_begin(next);
 
 	if (next && !insert) {
 		struct vm_area_struct *exporter = NULL, *importer = NULL;
@@ -922,12 +763,8 @@ int __vma_adjust(struct vm_area_struct *vma, unsigned long start,
 
 			importer->anon_vma = exporter->anon_vma;
 			error = anon_vma_clone(importer, exporter);
-			if (error) {
-				if (next && next != vma)
-					vm_raw_write_end(next);
-				vm_raw_write_end(vma);
+			if (error)
 				return error;
-			}
 		}
 	}
 again:
@@ -973,18 +810,17 @@ again:
 	}
 
 	if (start != vma->vm_start) {
-		WRITE_ONCE(vma->vm_start, start);
+		vma->vm_start = start;
 		start_changed = true;
 	}
 	if (end != vma->vm_end) {
-		WRITE_ONCE(vma->vm_end, end);
+		vma->vm_end = end;
 		end_changed = true;
 	}
-	WRITE_ONCE(vma->vm_pgoff, pgoff);
+	vma->vm_pgoff = pgoff;
 	if (adjust_next) {
-		WRITE_ONCE(next->vm_start,
-			   next->vm_start + (adjust_next << PAGE_SHIFT));
-		WRITE_ONCE(next->vm_pgoff, next->vm_pgoff + adjust_next);
+		next->vm_start += adjust_next << PAGE_SHIFT;
+		next->vm_pgoff += adjust_next;
 	}
 
 	if (root) {
@@ -1025,21 +861,8 @@ again:
 		if (start_changed)
 			vma_gap_update(vma);
 		if (end_changed) {
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-			/* Kui.Zhang@TEC.Kernel.Performance, 2019/03/13
-			 * reserve area top addr check
-			 */
-			if (!next) {
-				if (BACKUP_ALLOC_FLAG(vma->vm_flags))
-					mm->reserve_highest_vm_end =
-						vm_end_gap(vma);
-				else
-					mm->highest_vm_end = vm_end_gap(vma);
-			}
-#else
 			if (!next)
 				mm->highest_vm_end = vm_end_gap(vma);
-#endif
 			else if (!adjust_next)
 				vma_gap_update(next);
 		}
@@ -1062,23 +885,15 @@ again:
 	}
 
 	if (remove_next) {
-		if (file)
+		if (file) {
 			uprobe_munmap(next, next->vm_start, next->vm_end);
+			fput(file);
+		}
 		if (next->anon_vma)
 			anon_vma_merge(vma, next);
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-		/* Kui.Zhang@TEC.Kernel.Performance, 2019/03/13
-		 * reserve area top addr check
-		 */
-		if (BACKUP_ALLOC_FLAG(next->vm_flags))
-			mm->reserve_map_count--;
-		else
-			mm->map_count--;
-#else
 		mm->map_count--;
-#endif
-		vm_raw_write_end(next);
-		put_vma(next);
+		mpol_put(vma_policy(next));
+		kmem_cache_free(vm_area_cachep, next);
 		/*
 		 * In mprotect's case 6 (see comments on vma_merge),
 		 * we must remove another next too. It would clutter
@@ -1092,8 +907,6 @@ again:
 			 * "vma->vm_next" gap must be updated.
 			 */
 			next = vma->vm_next;
-			if (next)
-				vm_raw_write_begin(next);
 		} else {
 			/*
 			 * For the scope of the comment "next" and
@@ -1114,19 +927,6 @@ again:
 		}
 		else if (next)
 			vma_gap_update(next);
-#ifdef VNEDOR_EDIT
-		else {
-			/* Kui.Zhang@TEC.Kernel.Performance, 2019/03/13
-			 * reserve area top addr check
-			 */
-			if (BACKUP_ALLOC_FLAG(vma->vm_flags))
-				VM_WARN_ON(mm->reserve_highest_vm_end !=
-						vm_end_gap(vma));
-			else
-				VM_WARN_ON(mm->highest_vm_end !=
-						vm_end_gap(vma));
-		}
-#else
 		else {
 			/*
 			 * If remove_next == 2 we obviously can't
@@ -1149,15 +949,9 @@ again:
 			 */
 			VM_WARN_ON(mm->highest_vm_end != vm_end_gap(vma));
 		}
-#endif
 	}
 	if (insert && file)
 		uprobe_mmap(insert);
-
-	if (next && next != vma)
-		vm_raw_write_end(next);
-	if (!keep_locked)
-		vm_raw_write_end(vma);
 
 	validate_mm(mm);
 
@@ -1170,8 +964,7 @@ again:
  */
 static inline int is_mergeable_vma(struct vm_area_struct *vma,
 				struct file *file, unsigned long vm_flags,
-				struct vm_userfaultfd_ctx vm_userfaultfd_ctx,
-				const char __user *anon_name)
+				struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
 {
 	/*
 	 * VM_SOFTDIRTY should not prevent from VMA merging, if we
@@ -1188,8 +981,6 @@ static inline int is_mergeable_vma(struct vm_area_struct *vma,
 	if (vma->vm_ops && vma->vm_ops->close)
 		return 0;
 	if (!is_mergeable_vm_userfaultfd_ctx(vma, vm_userfaultfd_ctx))
-		return 0;
-	if (vma_get_anon_name(vma) != anon_name)
 		return 0;
 	return 1;
 }
@@ -1223,10 +1014,9 @@ static int
 can_vma_merge_before(struct vm_area_struct *vma, unsigned long vm_flags,
 		     struct anon_vma *anon_vma, struct file *file,
 		     pgoff_t vm_pgoff,
-		     struct vm_userfaultfd_ctx vm_userfaultfd_ctx,
-		     const char __user *anon_name)
+		     struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
 {
-	if (is_mergeable_vma(vma, file, vm_flags, vm_userfaultfd_ctx, anon_name) &&
+	if (is_mergeable_vma(vma, file, vm_flags, vm_userfaultfd_ctx) &&
 	    is_mergeable_anon_vma(anon_vma, vma->anon_vma, vma)) {
 		if (vma->vm_pgoff == vm_pgoff)
 			return 1;
@@ -1245,10 +1035,9 @@ static int
 can_vma_merge_after(struct vm_area_struct *vma, unsigned long vm_flags,
 		    struct anon_vma *anon_vma, struct file *file,
 		    pgoff_t vm_pgoff,
-		    struct vm_userfaultfd_ctx vm_userfaultfd_ctx,
-		    const char __user *anon_name)
+		    struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
 {
-	if (is_mergeable_vma(vma, file, vm_flags, vm_userfaultfd_ctx, anon_name) &&
+	if (is_mergeable_vma(vma, file, vm_flags, vm_userfaultfd_ctx) &&
 	    is_mergeable_anon_vma(anon_vma, vma->anon_vma, vma)) {
 		pgoff_t vm_pglen;
 		vm_pglen = vma_pages(vma);
@@ -1259,9 +1048,9 @@ can_vma_merge_after(struct vm_area_struct *vma, unsigned long vm_flags,
 }
 
 /*
- * Given a mapping request (addr,end,vm_flags,file,pgoff,anon_name),
- * figure out whether that can be merged with its predecessor or its
- * successor.  Or both (it neatly fills a hole).
+ * Given a mapping request (addr,end,vm_flags,file,pgoff), figure out
+ * whether that can be merged with its predecessor or its successor.
+ * Or both (it neatly fills a hole).
  *
  * In most cases - when called for mmap, brk or mremap - [addr,end) is
  * certain not to be mapped by the time vma_merge is called; but when
@@ -1298,13 +1087,12 @@ can_vma_merge_after(struct vm_area_struct *vma, unsigned long vm_flags,
  * parameter) may establish ptes with the wrong permissions of NNNN
  * instead of the right permissions of XXXX.
  */
-struct vm_area_struct *__vma_merge(struct mm_struct *mm,
+struct vm_area_struct *vma_merge(struct mm_struct *mm,
 			struct vm_area_struct *prev, unsigned long addr,
 			unsigned long end, unsigned long vm_flags,
 			struct anon_vma *anon_vma, struct file *file,
 			pgoff_t pgoff, struct mempolicy *policy,
-			struct vm_userfaultfd_ctx vm_userfaultfd_ctx,
-			const char __user *anon_name, bool keep_locked)
+			struct vm_userfaultfd_ctx vm_userfaultfd_ctx)
 {
 	pgoff_t pglen = (end - addr) >> PAGE_SHIFT;
 	struct vm_area_struct *area, *next;
@@ -1319,20 +1107,8 @@ struct vm_area_struct *__vma_merge(struct mm_struct *mm,
 
 	if (prev)
 		next = prev->vm_next;
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@TEC.Kernel.Performance, 2019/03/13
-	 * reserve area top addr check
-	 */
-	else {
-		if (BACKUP_ALLOC_FLAG(vm_flags))
-			next = mm->reserve_mmap;
-		else
-			next = mm->mmap;
-	}
-#else
 	else
 		next = mm->mmap;
-#endif
 	area = next;
 	if (area && area->vm_end == end)		/* cases 6, 7, 8 */
 		next = next->vm_next;
@@ -1349,8 +1125,7 @@ struct vm_area_struct *__vma_merge(struct mm_struct *mm,
 			mpol_equal(vma_policy(prev), policy) &&
 			can_vma_merge_after(prev, vm_flags,
 					    anon_vma, file, pgoff,
-					    vm_userfaultfd_ctx,
-					    anon_name)) {
+					    vm_userfaultfd_ctx)) {
 		/*
 		 * OK, it can.  Can we now merge in the successor as well?
 		 */
@@ -1359,18 +1134,16 @@ struct vm_area_struct *__vma_merge(struct mm_struct *mm,
 				can_vma_merge_before(next, vm_flags,
 						     anon_vma, file,
 						     pgoff+pglen,
-						     vm_userfaultfd_ctx,
-						     anon_name) &&
+						     vm_userfaultfd_ctx) &&
 				is_mergeable_anon_vma(prev->anon_vma,
 						      next->anon_vma, NULL)) {
 							/* cases 1, 6 */
 			err = __vma_adjust(prev, prev->vm_start,
 					 next->vm_end, prev->vm_pgoff, NULL,
-					 prev, keep_locked);
+					 prev);
 		} else					/* cases 2, 5, 7 */
 			err = __vma_adjust(prev, prev->vm_start,
-					   end, prev->vm_pgoff, NULL, prev,
-					   keep_locked);
+					 end, prev->vm_pgoff, NULL, prev);
 		if (err)
 			return NULL;
 		khugepaged_enter_vma_merge(prev, vm_flags);
@@ -1384,16 +1157,13 @@ struct vm_area_struct *__vma_merge(struct mm_struct *mm,
 			mpol_equal(policy, vma_policy(next)) &&
 			can_vma_merge_before(next, vm_flags,
 					     anon_vma, file, pgoff+pglen,
-					     vm_userfaultfd_ctx,
-					     anon_name)) {
+					     vm_userfaultfd_ctx)) {
 		if (prev && addr < prev->vm_end)	/* case 4 */
 			err = __vma_adjust(prev, prev->vm_start,
-					 addr, prev->vm_pgoff, NULL, next,
-					 keep_locked);
+					 addr, prev->vm_pgoff, NULL, next);
 		else {					/* cases 3, 8 */
 			err = __vma_adjust(area, addr, next->vm_end,
-					 next->vm_pgoff - pglen, NULL, next,
-					 keep_locked);
+					 next->vm_pgoff - pglen, NULL, next);
 			/*
 			 * In case 3 area is already equal to next and
 			 * this is a noop, but in case 8 "area" has
@@ -1717,26 +1487,6 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 			vm_flags |= VM_NORESERVE;
 	}
 
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * reserved area check
-	 */
-	if (check_reserve_mmap_doing(mm)) {
-		vm_flags |= (VM_BACKUP_CREATE|VM_DONTEXPAND|VM_SOFTDIRTY);
-	} else if (is_backed_addr(mm, addr, addr+len)) {
-		if (flags & MAP_FIXED) {
-			pr_err("%s mmap backed base:%#lx addr:%#lx len:%#lx with MAP_FIXED.\n",
-				current->comm,	mm->backed_vm_base, addr, len);
-			return -ENOMEM;
-		}
-
-		vm_flags |= VM_BACKUP_ALLOC;
-	} else if (!check_general_addr(mm, addr, addr+len)) {
-		pr_err("%s mmap backed base:%#lx addr:%#lx len:%#lx is invalid.\n",
-			current->comm, mm->backed_vm_base, addr, len);
-		return -ENOMEM;
-	}
-#endif
 	addr = mmap_region(file, addr, len, vm_flags, pgoff);
 	if (!IS_ERR_VALUE(addr) &&
 	    ((vm_flags & VM_LOCKED) ||
@@ -1744,44 +1494,6 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
 		*populate = len;
 	return addr;
 }
-
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-/* Kui.Zhang@TEC.Kernel.Performance, 2019/03/27,
- * create reserved area depend on do_reserve_mmap value,
- * but need check the env, only 32bit process can used reserved area
- */
-static inline unsigned long vm_mmap_pgoff_with_check(struct file *file,
-		unsigned long addr, unsigned long len, unsigned long prot,
-		unsigned long flags, unsigned long pgoff)
-{
-	int will_create_reserve = 0;
-	struct task_struct *task = current;
-	struct mm_struct *mm = task->mm;
-	unsigned long retval;
-
-	if ((flags & MAP_BACKUP_CREATE) && (addr == RESERVE_VMAP_ADDR) &&
-			!mm->reserve_vma && (mm->do_reserve_mmap == 0)) {
-		if (!test_thread_flag(TIF_32BIT) ||
-				!reserved_area_enable ||
-				!gpu_compat_high_limit_addr ||
-				(flags & MAP_FIXED)) {
-			return -EINVAL;
-		}
-		addr = 0;
-		reserve_mmap_doing(mm);
-		will_create_reserve = 1;
-		if (PAGE_ALIGN(len) > RESERVE_VMAP_AREA_SIZE)
-			len = RESERVE_VMAP_AREA_SIZE;
-	}
-
-	retval = vm_mmap_pgoff(file, addr, len, prot, flags, pgoff);
-
-	if (will_create_reserve)
-		reserve_mmap_done(mm);
-
-	return retval;
-}
-#endif
 
 SYSCALL_DEFINE6(mmap_pgoff, unsigned long, addr, unsigned long, len,
 		unsigned long, prot, unsigned long, flags,
@@ -1825,15 +1537,7 @@ SYSCALL_DEFINE6(mmap_pgoff, unsigned long, addr, unsigned long, len,
 
 	flags &= ~(MAP_EXECUTABLE | MAP_DENYWRITE);
 
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@TEC.Kernel.Performance, 2019/03/27,
-	 * check whether goto create reserved area
-	 */
-	retval = vm_mmap_pgoff_with_check(file, addr, len, prot, flags, pgoff);
-#else
 	retval = vm_mmap_pgoff(file, addr, len, prot, flags, pgoff);
-#endif
-
 out_fput:
 	if (file)
 		fput(file);
@@ -1963,7 +1667,7 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 	 * Can we just expand an old mapping?
 	 */
 	vma = vma_merge(mm, prev, addr, addr + len, vm_flags,
-			NULL, file, pgoff, NULL, NULL_VM_UFFD_CTX, NULL);
+			NULL, file, pgoff, NULL, NULL_VM_UFFD_CTX);
 	if (vma)
 		goto out;
 
@@ -1984,7 +1688,7 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 	vma->vm_flags = vm_flags;
 	vma->vm_page_prot = vm_get_page_prot(vm_flags);
 	vma->vm_pgoff = pgoff;
-	INIT_VMA(vma);
+	INIT_LIST_HEAD(&vma->anon_vma_chain);
 
 	if (file) {
 		if (vm_flags & VM_DENYWRITE) {
@@ -2037,15 +1741,13 @@ unsigned long mmap_region(struct file *file, unsigned long addr,
 out:
 	perf_event_mmap(vma);
 
-	vm_write_begin(vma);
 	vm_stat_account(mm, vm_flags, len >> PAGE_SHIFT);
 	if (vm_flags & VM_LOCKED) {
 		if (!((vm_flags & VM_SPECIAL) || is_vm_hugetlb_page(vma) ||
 					vma == get_gate_vma(current->mm)))
 			mm->locked_vm += (len >> PAGE_SHIFT);
 		else
-			WRITE_ONCE(vma->vm_flags,
-				   vma->vm_flags & VM_LOCKED_CLEAR_MASK);
+			vma->vm_flags &= VM_LOCKED_CLEAR_MASK;
 	}
 
 	if (file)
@@ -2058,20 +1760,9 @@ out:
 	 * then new mapped in-place (which must be aimed as
 	 * a completely new data area).
 	 */
-	WRITE_ONCE(vma->vm_flags, vma->vm_flags | VM_SOFTDIRTY);
+	vma->vm_flags |= VM_SOFTDIRTY;
 
 	vma_set_page_prot(vma);
-	vm_write_end(vma);
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * use the reserved vma
-	 */
-	if (BACKUP_CREATE_FLAG(vm_flags) && (!mm->reserve_vma)) {
-		mm->backed_vm_size = vma->vm_end - vma->vm_start;
-		mm->backed_vm_base = vma->vm_start;
-		mm->reserve_vma = vma;
-	}
-#endif
 
 	return addr;
 
@@ -2203,17 +1894,6 @@ unsigned long unmapped_area_topdown(struct vm_unmapped_area_info *info)
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma;
 	unsigned long length, low_limit, high_limit, gap_start, gap_end;
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * reserved area use
-	 */
-	struct rb_root *rb_r;
-
-	if (info->flags & VM_UNMAPPED_AREA_RESERVED)
-		rb_r = &mm->reserve_mm_rb;
-	else
-		rb_r = &mm->mm_rb;
-#endif
 
 	/* Adjust search length to account for worst case alignment overhead */
 	length = info->length + info->align_mask;
@@ -2234,34 +1914,14 @@ unsigned long unmapped_area_topdown(struct vm_unmapped_area_info *info)
 	low_limit = info->low_limit + length;
 
 	/* Check highest gap, which does not precede any rbtree node */
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * reserved area use
-	 */
-
-	if (info->flags & VM_UNMAPPED_AREA_RESERVED)
-		gap_start = mm->reserve_highest_vm_end;
-	else
-		gap_start = mm->highest_vm_end;
-#else
 	gap_start = mm->highest_vm_end;
-#endif
 	if (gap_start <= high_limit)
 		goto found_highest;
 
 	/* Check if rbtree root looks promising */
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * reserved area use
-	 */
-	if (RB_EMPTY_ROOT(rb_r))
-		return -ENOMEM;
-	vma = rb_entry(rb_r->rb_node, struct vm_area_struct, vm_rb);
-#else
 	if (RB_EMPTY_ROOT(&mm->mm_rb))
 		return -ENOMEM;
 	vma = rb_entry(mm->mm_rb.rb_node, struct vm_area_struct, vm_rb);
-#endif
 	if (vma->rb_subtree_gap < length)
 		return -ENOMEM;
 
@@ -2407,23 +2067,8 @@ arch_get_unmapped_area_topdown(struct file *filp, const unsigned long addr0,
 	info.flags = VM_UNMAPPED_AREA_TOPDOWN;
 	info.length = len;
 	info.low_limit = max(PAGE_SIZE, mmap_min_addr);
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@TEC.Kernel.Performance, 2019/03/27,
-	 * create reserved area must be below the gpu high limit addr
-	 */
-	if (check_reserve_mmap_doing(mm)) {
-		info.high_limit = (gpu_compat_high_limit_addr < mm->mmap_base) ?
-			gpu_compat_high_limit_addr : mm->mmap_base;
-		info.align_offset = 0;
-		info.align_mask = SZ_2M - 1;
-	} else {
-		info.high_limit = mm->mmap_base;
-		info.align_mask = 0;
-	}
-#else
 	info.high_limit = mm->mmap_base;
 	info.align_mask = 0;
-#endif
 	addr = vm_unmapped_area(&info);
 
 	/*
@@ -2489,23 +2134,17 @@ get_unmapped_area(struct file *file, unsigned long addr, unsigned long len,
 EXPORT_SYMBOL(get_unmapped_area);
 
 /* Look up the first VMA which satisfies  addr < vm_end,  NULL if none. */
-static struct vm_area_struct *__find_vma(struct mm_struct *mm,
-					 unsigned long addr)
+struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
 {
 	struct rb_node *rb_node;
-	struct vm_area_struct *vma = NULL;
+	struct vm_area_struct *vma;
 
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * reserved area use
-	 */
-	if (start_is_backed_addr(mm, addr))
-		rb_node = mm->reserve_mm_rb.rb_node;
-	else
-		rb_node = mm->mm_rb.rb_node;
-#else
+	/* Check the cache first. */
+	vma = vmacache_find(mm, addr);
+	if (likely(vma))
+		return vma;
+
 	rb_node = mm->mm_rb.rb_node;
-#endif
 
 	while (rb_node) {
 		struct vm_area_struct *tmp;
@@ -2521,39 +2160,12 @@ static struct vm_area_struct *__find_vma(struct mm_struct *mm,
 			rb_node = rb_node->rb_right;
 	}
 
-	return vma;
-}
-
-struct vm_area_struct *find_vma(struct mm_struct *mm, unsigned long addr)
-{
-	struct vm_area_struct *vma;
-
-	/* Check the cache first. */
-	vma = vmacache_find(mm, addr);
-	if (likely(vma))
-		return vma;
-
-	vma = __find_vma(mm, addr);
 	if (vma)
 		vmacache_update(addr, vma);
 	return vma;
 }
+
 EXPORT_SYMBOL(find_vma);
-
-#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
-struct vm_area_struct *get_vma(struct mm_struct *mm, unsigned long addr)
-{
-	struct vm_area_struct *vma = NULL;
-
-	read_lock(&mm->mm_rb_lock);
-	vma = __find_vma(mm, addr);
-	if (vma)
-		atomic_inc(&vma->vm_ref_count);
-	read_unlock(&mm->mm_rb_lock);
-
-	return vma;
-}
-#endif
 
 /*
  * Same as find_vma, but also return a pointer to the previous VMA in *pprev.
@@ -2703,22 +2315,8 @@ int expand_upwards(struct vm_area_struct *vma, unsigned long address)
 				anon_vma_interval_tree_post_update_vma(vma);
 				if (vma->vm_next)
 					vma_gap_update(vma->vm_next);
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-				else {
-					/* Kui.Zhang@PSW.TEC.KERNEL.Performance,
-					 * 2019/03/18, reserved area use
-					 */
-					if (BACKUP_ALLOC_FLAG(vma->vm_flags))
-						mm->reserve_highest_vm_end =
-							vm_end_gap(vma);
-					esle
-						mm->highest_vm_end =
-						vm_end_gap(vma);
-				}
-#else
 				else
 					mm->highest_vm_end = vm_end_gap(vma);
-#endif
 				spin_unlock(&mm->page_table_lock);
 
 				perf_event_mmap(vma);
@@ -2797,8 +2395,8 @@ int expand_downwards(struct vm_area_struct *vma,
 					mm->locked_vm += grow;
 				vm_stat_account(mm, vma->vm_flags, grow);
 				anon_vma_interval_tree_pre_update_vma(vma);
-				WRITE_ONCE(vma->vm_start, address);
-				WRITE_ONCE(vma->vm_pgoff, vma->vm_pgoff - grow);
+				vma->vm_start = address;
+				vma->vm_pgoff -= grow;
 				anon_vma_interval_tree_post_update_vma(vma);
 				vma_gap_update(vma);
 				spin_unlock(&mm->page_table_lock);
@@ -2844,7 +2442,8 @@ find_extend_vma(struct mm_struct *mm, unsigned long addr)
 	vma = find_vma_prev(mm, addr, &prev);
 	if (vma && (vma->vm_start <= addr))
 		return vma;
-	if (!prev || expand_stack(prev, addr))
+	/* don't alter vm_end if the coredump is running */
+	if (!prev || !mmget_still_valid(mm) || expand_stack(prev, addr))
 		return NULL;
 	if (prev->vm_flags & VM_LOCKED)
 		populate_vma_page_range(prev, addr, prev->vm_end, NULL);
@@ -2869,6 +2468,9 @@ find_extend_vma(struct mm_struct *mm, unsigned long addr)
 	if (vma->vm_start <= addr)
 		return vma;
 	if (!(vma->vm_flags & VM_GROWSDOWN))
+		return NULL;
+	/* don't alter vm_start if the coredump is running */
+	if (!mmget_still_valid(mm))
 		return NULL;
 	start = vma->vm_start;
 	if (expand_stack(vma, addr))
@@ -2914,44 +2516,15 @@ static void unmap_region(struct mm_struct *mm,
 		struct vm_area_struct *vma, struct vm_area_struct *prev,
 		unsigned long start, unsigned long end)
 {
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * reserved area use
-	 */
 	struct vm_area_struct *next = prev ? prev->vm_next : mm->mmap;
-	unsigned long free_flooring_addr = FIRST_USER_ADDRESS;
-	unsigned long free_ceiling_addr = USER_PGTABLES_CEILING;
-#else
-	struct vm_area_struct *next = prev ? prev->vm_next : mm->mmap;
-#endif
 	struct mmu_gather tlb;
-
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * reserved area use
-	 */
-	if (BACKUP_ALLOC_FLAG(vma->vm_flags)) {
-		free_flooring_addr = mm->reserve_vma->vm_start;
-		free_ceiling_addr = mm->reserve_vma->vm_end;
-		next = prev ? prev->vm_next : mm->reserve_mmap;
-	} else
-		next = prev ? prev->vm_next : mm->mmap;
-#endif
 
 	lru_add_drain();
 	tlb_gather_mmu(&tlb, mm, start, end);
 	update_hiwater_rss(mm);
 	unmap_vmas(&tlb, vma, start, end);
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * reserved area use
-	 */
-	free_pgtables(&tlb, vma, prev ? prev->vm_end : free_flooring_addr,
-			next ? next->vm_start : free_ceiling_addr);
-#else
 	free_pgtables(&tlb, vma, prev ? prev->vm_end : FIRST_USER_ADDRESS,
 				 next ? next->vm_start : USER_PGTABLES_CEILING);
-#endif
 	tlb_finish_mmu(&tlb, start, end);
 }
 
@@ -2965,31 +2538,12 @@ detach_vmas_to_be_unmapped(struct mm_struct *mm, struct vm_area_struct *vma,
 {
 	struct vm_area_struct **insertion_point;
 	struct vm_area_struct *tail_vma = NULL;
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * reserved area use
-	 */
-	int backed_alloc = 0;
 
-	if (BACKUP_ALLOC_FLAG(vma->vm_flags)) {
-		backed_alloc = 1;
-		insertion_point = (prev ? &prev->vm_next : &mm->reserve_mmap);
-	} else
-		insertion_point = (prev ? &prev->vm_next : &mm->mmap);
-#else
 	insertion_point = (prev ? &prev->vm_next : &mm->mmap);
-#endif
 	vma->vm_prev = NULL;
 	do {
-		vma_rb_erase(vma, mm);
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-		/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-		 * reserved area use
-		 */
-		(backed_alloc) ? mm->reserve_map_count-- : mm->map_count--;
-#else
+		vma_rb_erase(vma, &mm->mm_rb);
 		mm->map_count--;
-#endif
 		tail_vma = vma;
 		vma = vma->vm_next;
 	} while (vma && vma->vm_start < end);
@@ -2997,21 +2551,8 @@ detach_vmas_to_be_unmapped(struct mm_struct *mm, struct vm_area_struct *vma,
 	if (vma) {
 		vma->vm_prev = prev;
 		vma_gap_update(vma);
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * reserved area use
-	 */
-	} else {
-		if (backed_alloc)
-			mm->reserve_highest_vm_end =
-				prev ? vm_end_gap(prev) : 0;
-		else
-			mm->highest_vm_end = prev ? vm_end_gap(prev) : 0;
-	}
-#else
 	} else
 		mm->highest_vm_end = prev ? vm_end_gap(prev) : 0;
-#endif
 	tail_vma->vm_next = NULL;
 
 	/* Kill the cache */
@@ -3041,7 +2582,7 @@ static int __split_vma(struct mm_struct *mm, struct vm_area_struct *vma,
 	/* most fields are the same, copy all, and then fixup */
 	*new = *vma;
 
-	INIT_VMA(new);
+	INIT_LIST_HEAD(&new->anon_vma_chain);
 
 	if (new_below)
 		new->vm_end = addr;
@@ -3109,12 +2650,6 @@ int do_munmap(struct mm_struct *mm, unsigned long start, size_t len)
 {
 	unsigned long end;
 	struct vm_area_struct *vma, *prev, *last;
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * reserved area use
-	 */
-	int backed_addr_unmap = 0;
-#endif
 
 	if ((offset_in_page(start)) || start > TASK_SIZE || len > TASK_SIZE-start)
 		return -EINVAL;
@@ -3125,13 +2660,6 @@ int do_munmap(struct mm_struct *mm, unsigned long start, size_t len)
 
 	/* Find the first overlapping VMA */
 	vma = find_vma(mm, start);
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * reserved area use
-	 */
-	if (is_backed_addr(mm, start, start+len))
-		backed_addr_unmap = 1;
-#endif
 	if (!vma)
 		return 0;
 	prev = vma->vm_prev;
@@ -3173,17 +2701,7 @@ int do_munmap(struct mm_struct *mm, unsigned long start, size_t len)
 		if (error)
 			return error;
 	}
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * reserved area use
-	 */
-	if (backed_addr_unmap)
-		vma = prev ? prev->vm_next : mm->reserve_mmap;
-	else
-		vma = prev ? prev->vm_next : mm->mmap;
-#else
 	vma = prev ? prev->vm_next : mm->mmap;
-#endif
 
 	/*
 	 * unlock any mlock()ed ranges before detaching vmas
@@ -3212,7 +2730,6 @@ int do_munmap(struct mm_struct *mm, unsigned long start, size_t len)
 
 	return 0;
 }
-EXPORT_SYMBOL(do_munmap);
 
 int vm_munmap(unsigned long start, size_t len)
 {
@@ -3240,6 +2757,7 @@ SYSCALL_DEFINE2(munmap, unsigned long, addr, size_t, len)
 	up_write(&mm->mmap_sem);
 	return ret;
 }
+
 
 /*
  * Emulation of deprecated remap_file_pages() syscall.
@@ -3401,7 +2919,7 @@ static int do_brk(unsigned long addr, unsigned long len)
 
 	/* Can we just expand an old private anonymous mapping? */
 	vma = vma_merge(mm, prev, addr, addr + len, flags,
-			NULL, NULL, pgoff, NULL, NULL_VM_UFFD_CTX, NULL);
+			NULL, NULL, pgoff, NULL, NULL_VM_UFFD_CTX);
 	if (vma)
 		goto out;
 
@@ -3414,7 +2932,7 @@ static int do_brk(unsigned long addr, unsigned long len)
 		return -ENOMEM;
 	}
 
-	INIT_VMA(vma);
+	INIT_LIST_HEAD(&vma->anon_vma_chain);
 	vma->vm_mm = mm;
 	vma->vm_start = addr;
 	vma->vm_end = addr + len;
@@ -3457,121 +2975,6 @@ int vm_brk(unsigned long addr, unsigned long request)
 }
 EXPORT_SYMBOL(vm_brk);
 
-#if defined(VENDOR_EDIT) && defined(CONFIG_OPPO_HEALTHINFO) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-static inline bool check_parent_is_zygote(struct task_struct *tsk)
-{
-	struct task_struct *t;
-	bool ret = false;
-
-	rcu_read_lock();
-	t = rcu_dereference(tsk->real_parent);
-	if (t) {
-		const struct cred *tcred = __task_cred(t);
-
-		if (!strcmp(t->comm, "main") && (tcred->uid.val == 0) &&
-				(t->parent != 0) && !strcmp(t->parent->comm,"init"))
-			ret = true;
-	}
-	rcu_read_unlock();
-	return ret;
-}
-
-static void trigger_svm_oom_event(struct mm_struct *mm)
-{
-	int len = 0;
-	int oom = 0;
-	int res = 0;
-	int over_time = 0;
-	int change_stack = 0;
-	struct rlimit *rlim;
-	unsigned long long current_time_ns;
-	char *svm_oom_msg = (char*)kmalloc(128, GFP_KERNEL);
-
-	if (!(rlimit_svm_log && svm_oom_msg && is_compat_task() &&
-				check_parent_is_zygote(current))) {
-		if (svm_oom_msg)
-			kfree(svm_oom_msg);
-		return;
-	}
-
-	if (mm->reserve_vma)
-		res = 1;
-	if ((svm_oom_pid == current->pid) &&
-			time_after_eq((svm_oom_jiffies + 10*HZ), jiffies))
-		oom = 1;
-	rlim = current->signal->rlim + RLIMIT_STACK;
-	if (rlim->rlim_cur > STACK_RLIMIT_OVERFFLOW)
-		change_stack = 1;
-
-	if (change_stack) {
-		len = snprintf(svm_oom_msg, 127,
-				"{\"version\":1, \"size\":%ld, \"uid\":%u, \"type\":\"%s,%s\"}",
-				(long)rlim->rlim_cur,
-				(unsigned int)(current_uid().val),
-				(oom ? "oom" : "no_oom"),
-				(res ? "res" : "no_res"));
-		svm_oom_msg[len] = '\0';
-		ohm_action_trig_with_msg(OHM_RLIMIT_MON, svm_oom_msg);
-		kfree(svm_oom_msg);
-		return;
-	}
-
-	current_time_ns = ktime_get_boot_ns();
-	if ((current_time_ns > current->real_start_time) ||
-			(current_time_ns - current->real_start_time >= TRIGGER_TIME_NS))
-		over_time = 1;
-
-	if (oom || (!change_stack && !res && over_time)) {
-		len = snprintf(svm_oom_msg, 127,
-				"{\"version\":1, \"size\":%ld, \"uid\":%u, \"type\":\"%s,%s,%s\"}",
-				(long)mm->backed_vm_size,
-				(unsigned int)(current_uid().val),
-				(oom ? "oom" : "no_oom"),
-				(res ? "res" : "no_res"),
-				(change_stack ? "stack" : "no_stack"));
-		svm_oom_msg[len] = '\0';
-		ohm_action_trig_with_msg(OHM_SVM_MON, svm_oom_msg);
-	}
-	kfree(svm_oom_msg);
-}
-
-/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
- * free the reserved area
- */
-void exit_reserved_mmap(struct mm_struct *mm)
-{
-	struct mmu_gather tlb;
-	struct vm_area_struct *vma;
-	unsigned long nr_accounted = 0;
-	unsigned long start, end;
-
-	if (!mm->reserve_vma)
-		return;
-
-	vma = mm->reserve_mmap;
-	start = mm->reserve_vma->vm_start;
-	end = mm->reserve_vma->vm_end;
-	lru_add_drain();
-	flush_cache_mm(mm);
-	tlb_gather_mmu(&tlb, mm, start, end);
-	unmap_vmas(&tlb, vma, start, end);
-	free_pgtables(&tlb, vma, start, end);
-	tlb_finish_mmu(&tlb, start, end);
-
-	while (vma) {
-		if (vma->vm_flags & VM_ACCOUNT)
-			nr_accounted += vma_pages(vma);
-		vma = remove_vma(vma);
-	}
-	vm_unacct_memory(nr_accounted);
-
-	mm->reserve_vma = NULL;
-	mm->backed_vm_base = 0UL;
-	mm->backed_vm_size = 0UL;
-	mm->reserve_mm_rb = RB_ROOT;
-}
-#endif
-
 /* Release all mmaps. */
 void exit_mmap(struct mm_struct *mm)
 {
@@ -3597,16 +3000,6 @@ void exit_mmap(struct mm_struct *mm)
 	if (!vma)	/* Can happen if dup_mmap() received an OOM */
 		return;
 
-#if defined(VENDOR_EDIT) && defined(CONFIG_OPPO_HEALTHINFO) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * Trigger and upload the event.
-	 */
-	trigger_svm_oom_event(mm);
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * free the reserved area
-	 */
-	exit_reserved_mmap(mm);
-#endif
 	lru_add_drain();
 	flush_cache_mm(mm);
 	tlb_gather_mmu(&tlb, mm, 0, -1);
@@ -3614,23 +3007,6 @@ void exit_mmap(struct mm_struct *mm)
 	/* Use -1 here to ensure all VMAs in the mm are unmapped */
 	unmap_vmas(&tlb, vma, 0, -1);
 
-	if (unlikely(mm_is_oom_victim(mm))) {
-		/*
-		 * Wait for oom_reap_task() to stop working on this
-		 * mm. Because MMF_OOM_SKIP is already set before
-		 * calling down_read(), oom_reap_task() will not run
-		 * on this "mm" post up_write().
-		 *
-		 * mm_is_oom_victim() cannot be set from under us
-		 * either because victim->mm is already set to NULL
-		 * under task_lock before calling mmput and oom_mm is
-		 * set not NULL by the OOM killer only if victim->mm
-		 * is found not NULL while holding the task_lock.
-		 */
-		set_bit(MMF_OOM_SKIP, &mm->flags);
-		down_write(&mm->mmap_sem);
-		up_write(&mm->mmap_sem);
-	}
 	free_pgtables(&tlb, vma, FIRST_USER_ADDRESS, USER_PGTABLES_CEILING);
 	tlb_finish_mmu(&tlb, 0, -1);
 
@@ -3709,21 +3085,9 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 
 	if (find_vma_links(mm, addr, addr + len, &prev, &rb_link, &rb_parent))
 		return NULL;	/* should never get here */
-
-	/* There is 3 cases to manage here in
-	 *     AAAA            AAAA              AAAA              AAAA
-	 * PPPP....      PPPP......NNNN      PPPP....NNNN      PP........NN
-	 * PPPPPPPP(A)   PPPP..NNNNNNNN(B)   PPPPPPPPPPPP(1)       NULL
-	 *                                   PPPPPPPPNNNN(2)
-	 *                                   PPPPNNNNNNNN(3)
-	 *
-	 * new_vma == prev in case A,1,2
-	 * new_vma == next in case B,3
-	 */
-	new_vma = __vma_merge(mm, prev, addr, addr + len, vma->vm_flags,
-			      vma->anon_vma, vma->vm_file, pgoff,
-			      vma_policy(vma), vma->vm_userfaultfd_ctx,
-				vma_get_anon_name(vma), true);
+	new_vma = vma_merge(mm, prev, addr, addr + len, vma->vm_flags,
+			    vma->anon_vma, vma->vm_file, pgoff, vma_policy(vma),
+			    vma->vm_userfaultfd_ctx);
 	if (new_vma) {
 		/*
 		 * Source vma may have been merged into new_vma
@@ -3756,22 +3120,13 @@ struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
 		new_vma->vm_pgoff = pgoff;
 		if (vma_dup_policy(vma, new_vma))
 			goto out_free_vma;
-		INIT_VMA(new_vma);
+		INIT_LIST_HEAD(&new_vma->anon_vma_chain);
 		if (anon_vma_clone(new_vma, vma))
 			goto out_free_mempol;
 		if (new_vma->vm_file)
 			get_file(new_vma->vm_file);
 		if (new_vma->vm_ops && new_vma->vm_ops->open)
 			new_vma->vm_ops->open(new_vma);
-		/*
-		 * As the VMA is linked right now, it may be hit by the
-		 * speculative page fault handler. But we don't want it to
-		 * to start mapping page in this area until the caller has
-		 * potentially move the pte from the moved VMA. To prevent
-		 * that we protect it right now, and let the caller unprotect
-		 * it once the move is done.
-		 */
-		vm_raw_write_begin(new_vma);
 		vma_link(mm, new_vma, prev, rb_link, rb_parent);
 		*need_rmap_locks = false;
 	}
@@ -3903,7 +3258,7 @@ static struct vm_area_struct *__install_special_mapping(
 	if (unlikely(vma == NULL))
 		return ERR_PTR(-ENOMEM);
 
-	INIT_VMA(vma);
+	INIT_LIST_HEAD(&vma->anon_vma_chain);
 	vma->vm_mm = mm;
 	vma->vm_start = addr;
 	vma->vm_end = addr + len;
