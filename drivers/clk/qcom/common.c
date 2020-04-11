@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 2013-2014, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013-2014, 2017-2018,
+ * The Linux Foundation. All rights reserved.
  *
  * This software is licensed under the terms of the GNU General Public
  * License version 2, as published by the Free Software Foundation, and
@@ -10,6 +11,8 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  */
+
+#define pr_fmt(fmt) "clk: %s: " fmt, __func__
 
 #include <linux/export.h>
 #include <linux/module.h>
@@ -28,7 +31,15 @@
 struct qcom_cc {
 	struct qcom_reset_controller reset;
 	struct clk_regmap **rclks;
+	//#ifdef VENDOR_EDIT
+	//PengNan@BSP.Power.Basic,remove ufs and emmc compatibility for standby current, 2019/07/30
+	//struct clk_hw **hwclks;
+	//#endif
 	size_t num_rclks;
+	//#ifdef VENDOR_EDIT
+	//PengNan@BSP.Power.Basic,remove ufs and emmc compatibility for standby current, 2019/07/30
+	//size_t num_hwclks;
+	//#endif
 };
 
 const
@@ -36,9 +47,6 @@ struct freq_tbl *qcom_find_freq(const struct freq_tbl *f, unsigned long rate)
 {
 	if (!f)
 		return NULL;
-
-	if (!f->freq)
-		return f;
 
 	for (; f->freq; f++)
 		if (rate <= f->freq)
@@ -182,11 +190,20 @@ static struct clk_hw *qcom_cc_clk_hw_get(struct of_phandle_args *clkspec,
 {
 	struct qcom_cc *cc = data;
 	unsigned int idx = clkspec->args[0];
-
+	//#ifndef VENDOR_EDIT
+	//PengNan@BSP.Power.Basic,remove ufs and emmc compatibility for standby current, 2019/07/30
+	//if (idx >= cc->num_rclks + cc->num_hwclks) {
+	//#else
 	if (idx >= cc->num_rclks) {
-		pr_err("%s: invalid index %u\n", __func__, idx);
+	//#endif
+		pr_err("invalid index %u\n", idx);
 		return ERR_PTR(-EINVAL);
 	}
+	//#ifdef VENDOR_EDIT
+	//PengNan@BSP.Power.Basic,remove ufs and emmc compatibility for standby current, 2019/07/30
+	//if (idx < cc->num_hwclks && cc->hwclks[idx])
+	//	return cc->hwclks[idx];
+	//#endif
 
 	return cc->rclks[idx] ? &cc->rclks[idx]->hw : ERR_PTR(-ENOENT);
 }
@@ -199,8 +216,13 @@ int qcom_cc_really_probe(struct platform_device *pdev,
 	struct qcom_reset_controller *reset;
 	struct qcom_cc *cc;
 	struct gdsc_desc *scd;
-	size_t num_clks = desc->num_clks;
+	size_t num_clks = desc->num_clks;	
 	struct clk_regmap **rclks = desc->clks;
+	//#ifdef VENDOR_EDIT
+	//PengNan@BSP.Power.Basic,remove ufs and emmc compatibility for standby current, 2019/07/30
+	//size_t num_hwclks = desc->num_hwclks;
+	//struct clk_hw **hwclks = desc->hwclks;
+	//#endif
 
 	cc = devm_kzalloc(dev, sizeof(*cc), GFP_KERNEL);
 	if (!cc)
@@ -208,7 +230,22 @@ int qcom_cc_really_probe(struct platform_device *pdev,
 
 	cc->rclks = rclks;
 	cc->num_rclks = num_clks;
+	//#ifdef VENDOR_EDIT
+	//PengNan@BSP.Power.Basic,remove ufs and emmc compatibility for standby current, 2019/07/30
+	/*
+	cc->hwclks = hwclks;
+	cc->num_hwclks = num_hwclks;
 
+	for (i = 0; i < num_hwclks; i++) {
+		if (!hwclks[i])
+			continue;
+
+		ret = devm_clk_hw_register(dev, hwclks[i]);
+		if (ret)
+			return ret;
+	}
+	*/
+	//#endif
 	for (i = 0; i < num_clks; i++) {
 		if (!rclks[i])
 			continue;
@@ -277,5 +314,27 @@ int qcom_cc_probe(struct platform_device *pdev, const struct qcom_cc_desc *desc)
 	return qcom_cc_really_probe(pdev, desc, regmap);
 }
 EXPORT_SYMBOL_GPL(qcom_cc_probe);
+
+int qcom_cc_register_rcg_dfs(struct platform_device *pdev,
+			 const struct qcom_cc_dfs_desc *desc)
+{
+	struct clk_dfs *clks = desc->clks;
+	size_t num_clks = desc->num_clks;
+	int i, ret = 0;
+
+	for (i = 0; i < num_clks; i++) {
+		ret = clk_rcg2_get_dfs_clock_rate(clks[i].rcg, &pdev->dev,
+						clks[i].rcg_flags);
+		if (ret) {
+			dev_err(&pdev->dev,
+				"Failed calculating DFS frequencies for %s\n",
+				clk_hw_get_name(&(clks[i].rcg)->clkr.hw));
+			break;
+		}
+	}
+
+	return ret;
+}
+EXPORT_SYMBOL(qcom_cc_register_rcg_dfs);
 
 MODULE_LICENSE("GPL v2");
