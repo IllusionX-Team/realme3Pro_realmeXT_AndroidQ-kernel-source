@@ -531,10 +531,12 @@ static inline bool bpf_prog_was_classic(const struct bpf_prog *prog)
 #ifdef CONFIG_DEBUG_SET_MODULE_RONX
 static inline void bpf_prog_lock_ro(struct bpf_prog *fp)
 {
+	set_memory_ro((unsigned long)fp, fp->pages);
 }
 
 static inline void bpf_prog_unlock_ro(struct bpf_prog *fp)
 {
+	set_memory_rw((unsigned long)fp, fp->pages);
 }
 #else
 static inline void bpf_prog_lock_ro(struct bpf_prog *fp)
@@ -597,6 +599,7 @@ void bpf_warn_invalid_xdp_action(u32 act);
 #ifdef CONFIG_BPF_JIT
 extern int bpf_jit_enable;
 extern int bpf_jit_harden;
+extern long bpf_jit_limit;
 
 typedef void (*bpf_jit_fill_hole_t)(void *area, unsigned int size);
 

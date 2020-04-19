@@ -154,18 +154,6 @@ bulk:
 	return skb;
 }
 
-#ifdef VENDOR_EDIT
-//Junyuan.Huang@PSW.CN.WiFi.Network.1471780, 2018/06/26,
-//Add for limit speed function
-struct sk_buff *qdisc_dequeue_skb(struct Qdisc *q, bool *validate)
-{
-	int packets;
-
-	return dequeue_skb(q, validate, &packets);
-}
-EXPORT_SYMBOL(qdisc_dequeue_skb);
-#endif /* VENDOR_EDIT */
-
 /*
  * Transmit possibly several skbs, and handle the return status as
  * required. Owning running seqcount bit guarantees that
@@ -190,13 +178,8 @@ int sch_direct_xmit(struct sk_buff *skb, struct Qdisc *q,
 
 	if (likely(skb)) {
 		HARD_TX_LOCK(dev, txq, smp_processor_id());
-		if (!netif_xmit_frozen_or_stopped(txq)) {
-			if (unlikely(skb->fast_forwarded))
-				skb = dev_hard_start_xmit_list(skb, dev,
-							       txq, &ret);
-			else
-				skb = dev_hard_start_xmit(skb, dev, txq, &ret);
-		}
+		if (!netif_xmit_frozen_or_stopped(txq))
+			skb = dev_hard_start_xmit(skb, dev, txq, &ret);
 
 		HARD_TX_UNLOCK(dev, txq);
 	} else {
@@ -716,7 +699,11 @@ static void qdisc_rcu_free(struct rcu_head *head)
 
 void qdisc_destroy(struct Qdisc *qdisc)
 {
-	const struct Qdisc_ops  *ops = qdisc->ops;
+	const struct Qdisc_ops *ops;
+
+	if (!qdisc)
+		return;
+	ops = qdisc->ops;
 
 	if (qdisc->flags & TCQ_F_BUILTIN ||
 	    !atomic_dec_and_test(&qdisc->refcnt))

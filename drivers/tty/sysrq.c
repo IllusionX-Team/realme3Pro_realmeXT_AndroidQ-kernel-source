@@ -55,11 +55,10 @@
 static int __read_mostly sysrq_enabled = CONFIG_MAGIC_SYSRQ_DEFAULT_ENABLE;
 static bool __read_mostly sysrq_always_enabled;
 
-bool sysrq_on(void)
+static bool sysrq_on(void)
 {
 	return sysrq_enabled || sysrq_always_enabled;
 }
-EXPORT_SYMBOL(sysrq_on);
 
 /*
  * A value of 1 means 'all', other nonzero values are an op mask:
@@ -140,10 +139,6 @@ static void sysrq_handle_crash(int key)
 	 * complaint from the kernel before the panic.
 	 */
 	rcu_read_unlock();
-#ifdef VENDOR_EDIT
-/*Zhenjian.Jiang@PSW.BSP.Kernel.MM. 2019/03/19, modify for show dump_tasks when sysrq crash*/
-	dump_tasks(NULL, NULL);
-#endif /*VENDOR_EDIT*/
 	panic_on_oops = 1;	/* force panic */
 	wmb();
 	*killer = 1;
@@ -167,21 +162,6 @@ static struct sysrq_key_op sysrq_reboot_op = {
 	.action_msg	= "Resetting",
 	.enable_mask	= SYSRQ_ENABLE_BOOT,
 };
-
-#ifdef VENDOR_EDIT
-//jason.tang@TECH.BSP.Kernel.Storage, 2019-09-10, add ext4 urgent flush
-extern int panic_flush_device_cache(int timeout);
-static void sysrq_handle_flush(int key)
-{
-	panic_flush_device_cache(0);
-}
-static struct sysrq_key_op sysrq_flush_op = {
-	.handler	= sysrq_handle_flush,
-	.help_msg	= "flush(y)",
-	.action_msg	= "Emergency Flush",
-	.enable_mask	= SYSRQ_ENABLE_SYNC,
-};
-#endif
 
 static void sysrq_handle_sync(int key)
 {
@@ -506,12 +486,7 @@ static struct sysrq_key_op *sysrq_key_table[36] = {
 	/* x: May be registered on sparc64 for global PMU dump */
 	NULL,				/* x */
 	/* y: May be registered on sparc64 for global register dump */
-#ifdef VENDOR_EDIT
-//jason.tang@TECH.BSP.Kernel.Storage, 2019-09-10, add ext4 urgent flush
-	&sysrq_flush_op,                 /* y */
-#else
 	NULL,				/* y */
-#endif
 	&sysrq_ftrace_dump_op,		/* z */
 };
 
@@ -568,7 +543,6 @@ void __handle_sysrq(int key, bool check_mask)
 	 */
 	orig_log_level = console_loglevel;
 	console_loglevel = CONSOLE_LOGLEVEL_DEFAULT;
-	pr_info("SysRq : ");
 
         op_p = __sysrq_get_key_op(key);
         if (op_p) {
@@ -577,14 +551,15 @@ void __handle_sysrq(int key, bool check_mask)
 		 * should not) and is the invoked operation enabled?
 		 */
 		if (!check_mask || sysrq_on_mask(op_p->enable_mask)) {
-			pr_cont("%s\n", op_p->action_msg);
+			pr_info("%s\n", op_p->action_msg);
 			console_loglevel = orig_log_level;
 			op_p->handler(key);
 		} else {
-			pr_cont("This sysrq operation is disabled.\n");
+			pr_info("This sysrq operation is disabled.\n");
+			console_loglevel = orig_log_level;
 		}
 	} else {
-		pr_cont("HELP : ");
+		pr_info("HELP : ");
 		/* Only print the help msg once per handler */
 		for (i = 0; i < ARRAY_SIZE(sysrq_key_table); i++) {
 			if (sysrq_key_table[i]) {

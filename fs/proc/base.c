@@ -87,7 +87,6 @@
 #include <linux/slab.h>
 #include <linux/flex_array.h>
 #include <linux/posix-timers.h>
-#include <linux/cpufreq_times.h>
 #ifdef CONFIG_HARDWALL
 #include <asm/hardwall.h>
 #endif
@@ -96,18 +95,6 @@
 #include "fd.h"
 
 #include "../../lib/kstrtox.h"
-
-#ifdef VENDOR_EDIT
-/* Wen.Luo@BSP.Kernel.Stability, 2019/04/26, Add for Process memory statistics */
-extern size_t get_ion_heap_by_pid(pid_t pid);
-extern int get_gl_mem_by_pid(pid_t pid);
-#endif
-
-#ifdef VENDOR_EDIT
-// Liujie.Xie@TECH.Kernel.Sched, 2019/05/22, add for ui first
-#define GLOBAL_SYSTEM_UID KUIDT_INIT(1000)
-#define GLOBAL_SYSTEM_GID KGIDT_INIT(1000)
-#endif
 
 /* NOTE:
  *	Implementing inode permission operations in /proc is almost
@@ -210,60 +197,6 @@ static int proc_root_link(struct dentry *dentry, struct path *path)
 	}
 	return result;
 }
-
-#ifdef VENDOR_EDIT
-/* Wen.Luo@BSP.Kernel.Stability, 2019/04/26, Add for Process memory statistics */
-#define P2K(x) ((x) << (PAGE_SHIFT - 10)) /* Converts #Pages to KB */
-
-static ssize_t proc_pid_real_phymemory_read(struct file *file, char __user *buf,
-						     size_t _count, loff_t *pos)
-{
-	struct task_struct *tsk;
-	struct task_struct *p;
-	char buffer[128];
-	unsigned long rss = 0;
-	unsigned long rswap = 0;
-	unsigned long ion = 0;
-	unsigned long gpu = 0;
-	unsigned long totalram_size = 0;
-	size_t len;
-
-	BUG_ON(*pos < 0);
-
-	tsk = get_proc_task(file_inode(file));   //first_tid find will get_proc_task
-	if (!tsk)
-		return 0;
-	if (tsk->flags & PF_KTHREAD) {
-		put_task_struct(tsk);
-		return 0;
-	}
-	put_task_struct(tsk);
-
-	tsk = tsk->group_leader;
-	get_task_struct(tsk);
-	ion = get_ion_heap_by_pid(tsk->pid);
-	gpu = get_gl_mem_by_pid(tsk->pid);
-	ion = ion / 1024;
-	gpu = gpu / 1024;
-
-	p = find_lock_task_mm(tsk);
-	if (p) {
-		rss = P2K(get_mm_rss(p->mm));
-		rswap = P2K(get_mm_counter(p->mm, MM_SWAPENTS));
-		task_unlock(p);
-	}
-	totalram_size = ion + gpu + rss + rswap;
-	put_task_struct(tsk);
-	len = snprintf(buffer, sizeof(buffer), "RSS:%luKB \nRswap:%luKB \nION:%luKB \nGPU:%luKB \nTotalsize:%luKB \n",
-			rss, rswap, ion, gpu, totalram_size);
-	return simple_read_from_buffer(buf, _count, pos, buffer, len);
-}
-
-static const struct file_operations proc_pid_real_phymemory_ops = {
-	.read= proc_pid_real_phymemory_read,
-	.llseek= generic_file_llseek,
-};
-#endif
 
 static ssize_t proc_pid_cmdline_read(struct file *file, char __user *buf,
 				     size_t _count, loff_t *pos)
@@ -1010,212 +943,6 @@ static const struct file_operations proc_mem_operations = {
 	.release	= mem_release,
 };
 
-#ifdef VENDOR_EDIT
-// Liujie.Xie@TECH.Kernel.Sched, 2019/08/29, add for stuck monitor
-static int proc_stuck_trace_show(struct seq_file *m, void *v)
-{
-    struct inode *inode = m->private;
-    struct task_struct *p;
-    u64 d_time, s_time, ltt_time, big_time, rn_time, iow_time, binder_time, futex_time;
-    p = get_proc_task(inode);
-    if (!p) {
-        return -ESRCH;
-    }
-    task_lock(p);
-    iow_time = p->oppo_stuck_info.d_state.iowait_ns;
-    binder_time = p->oppo_stuck_info.s_state.binder_ns;
-    futex_time = p->oppo_stuck_info.s_state.futex_ns;
-
-    d_time = p->oppo_stuck_info.d_state.iowait_ns + p->oppo_stuck_info.d_state.mutex_ns +
-        p->oppo_stuck_info.d_state.downread_ns + p->oppo_stuck_info.d_state.downwrite_ns +
-        p->oppo_stuck_info.d_state.other_ns;
-
-    s_time = p->oppo_stuck_info.s_state.binder_ns + p->oppo_stuck_info.s_state.futex_ns +
-        p->oppo_stuck_info.s_state.epoll_ns + p->oppo_stuck_info.s_state.other_ns;
-
-    ltt_time = p->oppo_stuck_info.ltt_running_state[0] + p->oppo_stuck_info.ltt_running_state[1]+
-        p->oppo_stuck_info.ltt_running_state[2];
-
-    big_time = (p->oppo_stuck_info.big_running_state[0] + p->oppo_stuck_info.big_running_state[1]+
-        p->oppo_stuck_info.big_running_state[2]) ;
-
-    rn_time = p->oppo_stuck_info.runnable_state;
-
-    task_unlock(p);
-
-    seq_printf(m, "BR:%llu LR:%llu RN:%llu D:%llu IOW:%llu S:%llu BD:%llu FT:%llu\n",
-        big_time / NSEC_PER_MSEC, ltt_time / NSEC_PER_MSEC, rn_time / NSEC_PER_MSEC,
-        d_time / NSEC_PER_MSEC, iow_time / NSEC_PER_MSEC,
-        s_time / NSEC_PER_MSEC, binder_time / NSEC_PER_MSEC, futex_time / NSEC_PER_MSEC);
-    put_task_struct(p);
-    return 0;
-}
-
-static int proc_stuck_trace_open(struct inode* inode, struct file *filp)
-{
-    return single_open(filp, proc_stuck_trace_show, inode);
-}
-
-static ssize_t proc_stuck_trace_write(struct file *file, const char __user *buf,
-                size_t count, loff_t *ppos)
-{
-    struct task_struct *task;
-    char buffer[PROC_NUMBUF];
-    int err, stuck_trace;
-
-    memset(buffer, 0, sizeof(buffer));
-    if (count > sizeof(buffer) - 1)
-        count = sizeof(buffer) - 1;
-    if (copy_from_user(buffer, buf, count)) {
-        return -EFAULT;
-    }
-
-    err = kstrtoint(strstrip(buffer), 0, &stuck_trace);
-    if(err) {
-        return err;
-    }
-    task = get_proc_task(file_inode(file));
-    if (!task) {
-        return -ESRCH;
-    }
-
-    if (stuck_trace == 1) {
-        task->stuck_trace = 1;
-    } else if (stuck_trace == 0) {
-        task->stuck_trace = 0;
-        memset(&task->oppo_stuck_info, 0, sizeof(struct oppo_uifirst_monitor_info));
-    }
-
-    put_task_struct(task);
-    return count;
-}
-
-static ssize_t proc_stuck_trace_read(struct file* file, char __user *buf,
-        size_t count, loff_t *ppos)
-{
-    char buffer[128];
-    struct task_struct *task = NULL;
-    size_t len = 0;
-    u64 d_time, s_time, ltt_time, big_time, rn_time, iow_time, binder_time, futex_time;
-    task = get_proc_task(file_inode(file));
-    if (!task) {
-        return -ESRCH;
-    }
-
-    iow_time = task->oppo_stuck_info.d_state.iowait_ns;
-    binder_time = task->oppo_stuck_info.s_state.binder_ns;
-    futex_time = task->oppo_stuck_info.s_state.futex_ns;
-
-    d_time = task->oppo_stuck_info.d_state.iowait_ns + task->oppo_stuck_info.d_state.mutex_ns +
-        task->oppo_stuck_info.d_state.downread_ns + task->oppo_stuck_info.d_state.downwrite_ns +
-        task->oppo_stuck_info.d_state.other_ns;
-
-    s_time = task->oppo_stuck_info.s_state.binder_ns + task->oppo_stuck_info.s_state.futex_ns +
-        task->oppo_stuck_info.s_state.epoll_ns + task->oppo_stuck_info.s_state.other_ns;
-
-    ltt_time = task->oppo_stuck_info.ltt_running_state[0] + task->oppo_stuck_info.ltt_running_state[1]+
-        task->oppo_stuck_info.ltt_running_state[2];
-
-    big_time = (task->oppo_stuck_info.big_running_state[0] + task->oppo_stuck_info.big_running_state[1]+
-        task->oppo_stuck_info.big_running_state[2]) ;
-
-    rn_time = task->oppo_stuck_info.runnable_state;
-
-    put_task_struct(task);
-    len = snprintf(buffer, sizeof(buffer), "BR:%llu LR:%llu RN:%llu D:%llu IOW:%llu S:%llu BD:%llu FT:%llu\n",
-        big_time / NSEC_PER_MSEC, ltt_time / NSEC_PER_MSEC, rn_time / NSEC_PER_MSEC,
-        d_time / NSEC_PER_MSEC, iow_time / NSEC_PER_MSEC,
-        s_time / NSEC_PER_MSEC, binder_time / NSEC_PER_MSEC, futex_time / NSEC_PER_MSEC);
-
-    return simple_read_from_buffer(buf, count, ppos, buffer, len);
-}
-
-static const struct file_operations proc_stuck_trace_operations = {
-    .open       = proc_stuck_trace_open,
-    .write      = proc_stuck_trace_write,
-    .read       = proc_stuck_trace_read,
-    .llseek     = seq_lseek,
-    .release    = single_release,
-};
-#endif
-
-#ifdef VENDOR_EDIT
-// Liujie.Xie@TECH.Kernel.Sched, 2019/05/22, add for ui first
-static int proc_static_ux_show(struct seq_file *m, void *v)
-{
-    struct inode *inode = m->private;
-    struct task_struct *p;
-    p = get_proc_task(inode);
-    if (!p) {
-        return -ESRCH;
-    }
-    task_lock(p);
-    seq_printf(m, "%d\n", p->static_ux);
-    task_unlock(p);
-    put_task_struct(p);
-    return 0;
-}
-
-static int proc_static_ux_open(struct inode* inode, struct file *filp)
-{
-    return single_open(filp, proc_static_ux_show, inode);
-}
-
-static ssize_t proc_static_ux_write(struct file *file, const char __user *buf,
-                size_t count, loff_t *ppos)
-{
-    struct task_struct *task;
-    char buffer[PROC_NUMBUF];
-    int err, static_ux;
-
-    memset(buffer, 0, sizeof(buffer));
-    if (count > sizeof(buffer) - 1)
-        count = sizeof(buffer) - 1;
-    if (copy_from_user(buffer, buf, count)) {
-        return -EFAULT;
-    }
-
-    err = kstrtoint(strstrip(buffer), 0, &static_ux);
-    if(err) {
-        return err;
-    }
-    task = get_proc_task(file_inode(file));
-    if (!task) {
-        return -ESRCH;
-    }
-
-    task->static_ux = static_ux != 0 ? 1 : 0;
-
-    put_task_struct(task);
-    return count;
-}
-
-static ssize_t proc_static_ux_read(struct file* file, char __user *buf,
-							    size_t count, loff_t *ppos)
-{
-	char buffer[PROC_NUMBUF];
-	struct task_struct *task = NULL;
-	int static_ux = -1;
-	size_t len = 0;
-	task = get_proc_task(file_inode(file));
-	if (!task) {
-		return -ESRCH;
-	}
-	static_ux = task->static_ux;
-	put_task_struct(task);
-	len = snprintf(buffer, sizeof(buffer), "%d\n", static_ux);
-	return simple_read_from_buffer(buf, count, ppos, buffer, len);
-}
-
-static const struct file_operations proc_static_ux_operations = {
-	.open       = proc_static_ux_open,
-	.write      = proc_static_ux_write,
-	.read       = proc_static_ux_read,
-	.llseek     = seq_lseek,
-	.release    = single_release,
-};
-#endif
-
 static int environ_open(struct inode *inode, struct file *file)
 {
 	return __mem_open(inode, file, PTRACE_MODE_READ);
@@ -1721,204 +1448,6 @@ static const struct file_operations proc_pid_sched_operations = {
 
 #endif
 
-/*
- * Print out various scheduling related per-task fields:
- */
-
-#ifdef CONFIG_SMP
-
-static int sched_wake_up_idle_show(struct seq_file *m, void *v)
-{
-	struct inode *inode = m->private;
-	struct task_struct *p;
-
-	p = get_proc_task(inode);
-	if (!p)
-		return -ESRCH;
-
-	seq_printf(m, "%d\n", sched_get_wake_up_idle(p));
-
-	put_task_struct(p);
-
-	return 0;
-}
-
-static ssize_t
-sched_wake_up_idle_write(struct file *file, const char __user *buf,
-	    size_t count, loff_t *offset)
-{
-	struct inode *inode = file_inode(file);
-	struct task_struct *p;
-	char buffer[PROC_NUMBUF];
-	int wake_up_idle, err;
-
-	memset(buffer, 0, sizeof(buffer));
-	if (count > sizeof(buffer) - 1)
-		count = sizeof(buffer) - 1;
-	if (copy_from_user(buffer, buf, count)) {
-		err = -EFAULT;
-		goto out;
-	}
-
-	err = kstrtoint(strstrip(buffer), 0, &wake_up_idle);
-	if (err)
-		goto out;
-
-	p = get_proc_task(inode);
-	if (!p)
-		return -ESRCH;
-
-	err = sched_set_wake_up_idle(p, wake_up_idle);
-
-	put_task_struct(p);
-
-out:
-	return err < 0 ? err : count;
-}
-
-static int sched_wake_up_idle_open(struct inode *inode, struct file *filp)
-{
-	return single_open(filp, sched_wake_up_idle_show, inode);
-}
-
-static const struct file_operations proc_pid_sched_wake_up_idle_operations = {
-	.open		= sched_wake_up_idle_open,
-	.read		= seq_read,
-	.write		= sched_wake_up_idle_write,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-#endif	/* CONFIG_SMP */
-
-#ifdef CONFIG_SCHED_WALT
-
-static int sched_init_task_load_show(struct seq_file *m, void *v)
-{
-	struct inode *inode = m->private;
-	struct task_struct *p;
-
-	p = get_proc_task(inode);
-	if (!p)
-		return -ESRCH;
-
-	seq_printf(m, "%d\n", sched_get_init_task_load(p));
-
-	put_task_struct(p);
-
-	return 0;
-}
-
-static ssize_t
-sched_init_task_load_write(struct file *file, const char __user *buf,
-	    size_t count, loff_t *offset)
-{
-	struct inode *inode = file_inode(file);
-	struct task_struct *p;
-	char buffer[PROC_NUMBUF];
-	int init_task_load, err;
-
-	memset(buffer, 0, sizeof(buffer));
-	if (count > sizeof(buffer) - 1)
-		count = sizeof(buffer) - 1;
-	if (copy_from_user(buffer, buf, count)) {
-		err = -EFAULT;
-		goto out;
-	}
-
-	err = kstrtoint(strstrip(buffer), 0, &init_task_load);
-	if (err)
-		goto out;
-
-	p = get_proc_task(inode);
-	if (!p)
-		return -ESRCH;
-
-	err = sched_set_init_task_load(p, init_task_load);
-
-	put_task_struct(p);
-
-out:
-	return err < 0 ? err : count;
-}
-
-static int sched_init_task_load_open(struct inode *inode, struct file *filp)
-{
-	return single_open(filp, sched_init_task_load_show, inode);
-}
-
-static const struct file_operations proc_pid_sched_init_task_load_operations = {
-	.open		= sched_init_task_load_open,
-	.read		= seq_read,
-	.write		= sched_init_task_load_write,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-static int sched_group_id_show(struct seq_file *m, void *v)
-{
-	struct inode *inode = m->private;
-	struct task_struct *p;
-
-	p = get_proc_task(inode);
-	if (!p)
-		return -ESRCH;
-
-	seq_printf(m, "%d\n", sched_get_group_id(p));
-
-	put_task_struct(p);
-
-	return 0;
-}
-
-static ssize_t
-sched_group_id_write(struct file *file, const char __user *buf,
-	    size_t count, loff_t *offset)
-{
-	struct inode *inode = file_inode(file);
-	struct task_struct *p;
-	char buffer[PROC_NUMBUF];
-	int group_id, err;
-
-	memset(buffer, 0, sizeof(buffer));
-	if (count > sizeof(buffer) - 1)
-		count = sizeof(buffer) - 1;
-	if (copy_from_user(buffer, buf, count)) {
-		err = -EFAULT;
-		goto out;
-	}
-
-	err = kstrtoint(strstrip(buffer), 0, &group_id);
-	if (err)
-		goto out;
-
-	p = get_proc_task(inode);
-	if (!p)
-		return -ESRCH;
-
-	err = sched_set_group_id(p, group_id);
-
-	put_task_struct(p);
-
-out:
-	return err < 0 ? err : count;
-}
-
-static int sched_group_id_open(struct inode *inode, struct file *filp)
-{
-	return single_open(filp, sched_group_id_show, inode);
-}
-
-static const struct file_operations proc_pid_sched_group_id_operations = {
-	.open		= sched_group_id_open,
-	.read		= seq_read,
-	.write		= sched_group_id_write,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-#endif	/* CONFIG_SCHED_WALT */
-
 #ifdef CONFIG_SCHED_AUTOGROUP
 /*
  * Print out autogroup related information:
@@ -2222,22 +1751,6 @@ int pid_getattr(struct vfsmount *mnt, struct dentry *dentry, struct kstat *stat)
 	return 0;
 }
 
-#ifdef VENDOR_EDIT
-// Liujie.Xie@TECH.Kernel.Sched, 2019/05/22, add for ui first
-bool is_special_entry(struct dentry *dentry, const char* special_proc)
-{
-    const unsigned char *name;
-    if (NULL == dentry || NULL == special_proc)
-        return false;
-
-    name = dentry->d_name.name;
-    if (NULL != name && !strncmp(special_proc, name, 32))
-        return true;
-    else
-        return false;
-}
-#endif
-
 /* dentry stuff */
 
 /*
@@ -2279,15 +1792,6 @@ int pid_revalidate(struct dentry *dentry, unsigned int flags)
 			inode->i_uid = GLOBAL_ROOT_UID;
 			inode->i_gid = GLOBAL_ROOT_GID;
 		}
-
-#ifdef VENDOR_EDIT
-// Liujie.Xie@TECH.Kernel.Sched, 2019/05/22, add for ui first
-        if (is_special_entry(dentry, "static_ux")) {
-            inode->i_uid = GLOBAL_SYSTEM_UID;
-            inode->i_gid = GLOBAL_SYSTEM_GID;
-        }
-#endif
-
 		inode->i_mode &= ~(S_ISUID | S_ISGID);
 		security_task_to_inode(task, inode);
 		put_task_struct(task);
@@ -3231,52 +2735,6 @@ static int proc_tgid_io_accounting(struct seq_file *m, struct pid_namespace *ns,
 }
 #endif /* CONFIG_TASK_IO_ACCOUNTING */
 
-#ifdef CONFIG_DETECT_HUNG_TASK
-static ssize_t proc_hung_task_detection_enabled_read(struct file *file,
-				char __user *buf, size_t count, loff_t *ppos)
-{
-	struct task_struct *task = get_proc_task(file_inode(file));
-	char buffer[PROC_NUMBUF];
-	size_t len;
-	bool hang_detection_enabled;
-
-	if (!task)
-		return -ESRCH;
-	hang_detection_enabled = task->hang_detection_enabled;
-	put_task_struct(task);
-
-	len = snprintf(buffer, sizeof(buffer), "%d\n", hang_detection_enabled);
-
-	return simple_read_from_buffer(buf, sizeof(buffer), ppos, buffer, len);
-}
-
-static ssize_t proc_hung_task_detection_enabled_write(struct file *file,
-			const char __user *buf, size_t count, loff_t *ppos)
-{
-	struct task_struct *task;
-	bool hang_detection_enabled;
-	int rv;
-
-	rv = kstrtobool_from_user(buf, count, &hang_detection_enabled);
-	if (rv < 0)
-		return rv;
-
-	task = get_proc_task(file_inode(file));
-	if (!task)
-		return -ESRCH;
-	task->hang_detection_enabled = hang_detection_enabled;
-	put_task_struct(task);
-
-	return count;
-}
-
-static const struct file_operations proc_hung_task_detection_enabled_operations = {
-	.read		= proc_hung_task_detection_enabled_read,
-	.write		= proc_hung_task_detection_enabled_write,
-	.llseek		= generic_file_llseek,
-};
-#endif
-
 #ifdef CONFIG_USER_NS
 static int proc_id_map_open(struct inode *inode, struct file *file,
 	const struct seq_operations *seq_ops)
@@ -3440,13 +2898,6 @@ static const struct pid_entry tgid_base_stuff[] = {
 	ONE("status",     S_IRUGO, proc_pid_status),
 	ONE("personality", S_IRUSR, proc_pid_personality),
 	ONE("limits",	  S_IRUGO, proc_pid_limits),
-#ifdef CONFIG_SMP
-	REG("sched_wake_up_idle",      S_IRUGO|S_IWUSR, proc_pid_sched_wake_up_idle_operations),
-#endif
-#ifdef CONFIG_SCHED_WALT
-	REG("sched_init_task_load",      S_IRUGO|S_IWUSR, proc_pid_sched_init_task_load_operations),
-	REG("sched_group_id",      S_IRUGO|S_IWUGO, proc_pid_sched_group_id_operations),
-#endif
 #ifdef CONFIG_SCHED_DEBUG
 	REG("sched",      S_IRUGO|S_IWUSR, proc_pid_sched_operations),
 #endif
@@ -3461,13 +2912,6 @@ static const struct pid_entry tgid_base_stuff[] = {
 	ONE("stat",       S_IRUGO, proc_tgid_stat),
 	ONE("statm",      S_IRUGO, proc_pid_statm),
 	REG("maps",       S_IRUGO, proc_pid_maps_operations),
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * read the reserved mmaps
-	 */
-	REG("reserve_maps", S_IRUSR, proc_pid_rmaps_operations),
-	ONE("reserve_area", S_IRUSR, proc_pid_reserve_area),
-#endif
 #ifdef CONFIG_NUMA
 	REG("numa_maps",  S_IRUGO, proc_pid_numa_maps_operations),
 #endif
@@ -3478,13 +2922,9 @@ static const struct pid_entry tgid_base_stuff[] = {
 	REG("mounts",     S_IRUGO, proc_mounts_operations),
 	REG("mountinfo",  S_IRUGO, proc_mountinfo_operations),
 	REG("mountstats", S_IRUSR, proc_mountstats_operations),
-#ifdef CONFIG_PROCESS_RECLAIM
-	REG("reclaim", S_IWUSR, proc_reclaim_operations),
-#endif
 #ifdef CONFIG_PROC_PAGE_MONITOR
 	REG("clear_refs", S_IWUSR, proc_clear_refs_operations),
 	REG("smaps",      S_IRUGO, proc_pid_smaps_operations),
-	REG("smaps_rollup", S_IRUGO, proc_pid_smaps_rollup_operations),
 	REG("pagemap",    S_IRUSR, proc_pagemap_operations),
 #endif
 #ifdef CONFIG_SECURITY
@@ -3527,10 +2967,6 @@ static const struct pid_entry tgid_base_stuff[] = {
 #ifdef CONFIG_HARDWALL
 	ONE("hardwall",   S_IRUGO, proc_pid_hardwall),
 #endif
-#ifdef CONFIG_DETECT_HUNG_TASK
-	REG("hang_detection_enabled", 0666,
-		proc_hung_task_detection_enabled_operations),
-#endif
 #ifdef CONFIG_USER_NS
 	REG("uid_map",    S_IRUGO|S_IWUSR, proc_uid_map_operations),
 	REG("gid_map",    S_IRUGO|S_IWUSR, proc_gid_map_operations),
@@ -3541,17 +2977,6 @@ static const struct pid_entry tgid_base_stuff[] = {
 	REG("timers",	  S_IRUGO, proc_timers_operations),
 #endif
 	REG("timerslack_ns", S_IRUGO|S_IWUGO, proc_pid_set_timerslack_ns_operations),
-#ifdef CONFIG_CPU_FREQ_TIMES
-	ONE("time_in_state", 0444, proc_time_in_state_show),
-#endif
-#ifdef VENDOR_EDIT
-	/* Wen.Luo@BSP.Kernel.Stability, 2019/04/26, Add for Process memory statistics */
-	REG("real_phymemory",    S_IRUGO, proc_pid_real_phymemory_ops),
-#endif
-#ifdef VENDOR_EDIT
-// Liujie.Xie@TECH.Kernel.Sched, 2019/08/29, add for stuck monitor
-    REG("stuck_info", S_IRUGO | S_IWUGO, proc_stuck_trace_operations),
-#endif
 };
 
 static int proc_tgid_base_readdir(struct file *file, struct dir_context *ctx)
@@ -3891,7 +3316,6 @@ static const struct pid_entry tid_base_stuff[] = {
 #ifdef CONFIG_PROC_PAGE_MONITOR
 	REG("clear_refs", S_IWUSR, proc_clear_refs_operations),
 	REG("smaps",     S_IRUGO, proc_tid_smaps_operations),
-	REG("smaps_rollup", S_IRUGO, proc_pid_smaps_rollup_operations),
 	REG("pagemap",    S_IRUSR, proc_pagemap_operations),
 #endif
 #ifdef CONFIG_SECURITY
@@ -3931,26 +3355,11 @@ static const struct pid_entry tid_base_stuff[] = {
 #ifdef CONFIG_HARDWALL
 	ONE("hardwall",   S_IRUGO, proc_pid_hardwall),
 #endif
-#ifdef CONFIG_DETECT_HUNG_TASK
-	REG("hang_detection_enabled", 0666,
-		proc_hung_task_detection_enabled_operations),
-#endif
 #ifdef CONFIG_USER_NS
 	REG("uid_map",    S_IRUGO|S_IWUSR, proc_uid_map_operations),
 	REG("gid_map",    S_IRUGO|S_IWUSR, proc_gid_map_operations),
 	REG("projid_map", S_IRUGO|S_IWUSR, proc_projid_map_operations),
 	REG("setgroups",  S_IRUGO|S_IWUSR, proc_setgroups_operations),
-#endif
-#ifdef CONFIG_CPU_FREQ_TIMES
-	ONE("time_in_state", 0444, proc_time_in_state_show),
-#endif
-#ifdef VENDOR_EDIT
-	/* Wen.Luo@BSP.Kernel.Stability, 2019/04/26, Add for Process memory statistics */
-	REG("real_phymemory",    S_IRUGO, proc_pid_real_phymemory_ops),
-#endif
-#ifdef VENDOR_EDIT
-// Liujie.Xie@TECH.Kernel.Sched, 2019/05/22, add for ui first
-    REG("static_ux", S_IRUGO | S_IWUSR, proc_static_ux_operations),
 #endif
 };
 

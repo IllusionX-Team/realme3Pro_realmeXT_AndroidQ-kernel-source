@@ -262,6 +262,11 @@ struct page_frag_cache {
 
 typedef unsigned long vm_flags_t;
 
+static inline atomic_t *compound_mapcount_ptr(struct page *page)
+{
+	return &page[1].compound_mapcount;
+}
+
 /*
  * A region containing a mapping of a non-memory backed file under NOMMU
  * conditions.  These are held in a global tree and are pinned by the VMAs that
@@ -326,18 +331,11 @@ struct vm_area_struct {
 	/*
 	 * For areas with an address space and backing store,
 	 * linkage into the address_space->i_mmap interval tree.
-	 *
-	 * For private anonymous mappings, a pointer to a null terminated string
-	 * in the user process containing the name given to the vma, or NULL
-	 * if unnamed.
 	 */
-	union {
-		struct {
-			struct rb_node rb;
-			unsigned long rb_subtree_last;
-		} shared;
-		const char __user *anon_name;
-	};
+	struct {
+		struct rb_node rb;
+		unsigned long rb_subtree_last;
+	} shared;
 
 	/*
 	 * A file's MAP_PRIVATE vma can be in both i_mmap tree and anon_vma
@@ -365,10 +363,6 @@ struct vm_area_struct {
 	struct mempolicy *vm_policy;	/* NUMA policy for the VMA */
 #endif
 	struct vm_userfaultfd_ctx vm_userfaultfd_ctx;
-#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
-	seqcount_t vm_sequence;
-	atomic_t vm_ref_count;		/* see vma_get(), vma_put() */
-#endif
 };
 
 struct core_thread {
@@ -407,9 +401,6 @@ struct kioctx_table;
 struct mm_struct {
 	struct vm_area_struct *mmap;		/* list of VMAs */
 	struct rb_root mm_rb;
-#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
-	rwlock_t mm_rb_lock;
-#endif
 	u64 vmacache_seqnum;                   /* per-thread vmacache */
 #ifdef CONFIG_MMU
 	unsigned long (*get_unmapped_area) (struct file *filp,
@@ -535,45 +526,7 @@ struct mm_struct {
 	atomic_long_t hugetlb_usage;
 #endif
 	struct work_struct async_put_work;
-
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-	/* Kui.Zhang@PSW.TEC.KERNEL.Performance, 2019/03/18,
-	 * reserved vma
-	 */
-	struct vm_area_struct *reserve_vma;
-	struct vm_area_struct *reserve_mmap;
-	struct rb_root reserve_mm_rb;
-	unsigned long reserve_highest_vm_end;
-	unsigned long backed_vm_base;
-	unsigned long backed_vm_size;
-	int reserve_map_count;
-	int do_reserve_mmap;
-#endif
 };
-
-#if defined(VENDOR_EDIT) && defined(CONFIG_VIRTUAL_RESERVE_MEMORY)
-/* Kui.Zhang@TEC.Kernel.Performance, 2019/03/27,
- * create reserved area depend on do_reserve_mmap value,
- * but need check the env, only 32bit process can used reserved area
- */
-#define DONE_RESERVE_MMAP 0xDE
-#define DOING_RESERVE_MMAP 0xDA
-
-static inline int check_reserve_mmap_doing(struct mm_struct *mm)
-{
-	return (mm && (mm->do_reserve_mmap == DOING_RESERVE_MMAP));
-}
-
-static inline void reserve_mmap_doing(struct mm_struct *mm)
-{
-	mm->do_reserve_mmap = DOING_RESERVE_MMAP;
-}
-
-static inline void reserve_mmap_done(struct mm_struct *mm)
-{
-	mm->do_reserve_mmap = DONE_RESERVE_MMAP;
-}
-#endif
 
 static inline void mm_init_cpumask(struct mm_struct *mm)
 {
@@ -671,14 +624,5 @@ enum tlb_flush_reason {
 typedef struct {
 	unsigned long val;
 } swp_entry_t;
-
-/* Return the name for an anonymous mapping or NULL for a file-backed mapping */
-static inline const char __user *vma_get_anon_name(struct vm_area_struct *vma)
-{
-	if (vma->vm_file)
-		return NULL;
-
-	return vma->anon_name;
-}
 
 #endif /* _LINUX_MM_TYPES_H */

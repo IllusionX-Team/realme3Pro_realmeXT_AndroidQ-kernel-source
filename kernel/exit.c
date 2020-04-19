@@ -55,8 +55,6 @@
 #include <linux/shm.h>
 #include <linux/kcov.h>
 
-#include "sched/tune.h"
-
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
 #include <asm/pgtable.h>
@@ -338,23 +336,6 @@ static bool has_stopped_jobs(struct pid *pgrp)
 	return false;
 }
 
-#ifdef VENDOR_EDIT
-//Shu.Liu@PSW.AD.Stability.Crash.1052210, 2014/01/20, Add for not kill zygote
-static bool oppo_is_android_core_group(struct pid *pgrp)
-{
-    struct task_struct *p;
-
-    do_each_pid_task(pgrp, PIDTYPE_PGID, p) {
-        if (( !strcmp(p->comm, "zygote") ) || ( !strcmp(p->comm, "main")) ) {
-            printk("oppo_is_android_core_group: find zygote will be hungup, ignore it \n");
-            return true;
-        }
-    } while_each_pid_task(pgrp, PIDTYPE_PGID, p);
-
-    return false;
-}
-#endif /* VENDOR_EDIT */
-
 /*
  * Check to see if any process groups have become orphaned as
  * a result of our exiting, and if they have any stopped jobs,
@@ -381,13 +362,6 @@ kill_orphaned_pgrp(struct task_struct *tsk, struct task_struct *parent)
 	    task_session(parent) == task_session(tsk) &&
 	    will_become_orphaned_pgrp(pgrp, ignored_task) &&
 	    has_stopped_jobs(pgrp)) {
-#ifdef VENDOR_EDIT
-//Shu.Liu@PSW.AD.Stability.Crash.1052210, 2014/01/10, Add for clean backstage
-            if (oppo_is_android_core_group(pgrp)) {
-                printk("kill_orphaned_pgrp: find android core process will be hungup, ignored it, only hungup itself:%s:%d , current=%d \n",tsk->comm,tsk->pid,current->pid);
-                return;
-            }
-#endif /* VENDOR_EDIT */
 		__kill_pgrp_info(SIGHUP, SEND_SIG_PRIV, pgrp);
 		__kill_pgrp_info(SIGCONT, SEND_SIG_PRIV, pgrp);
 	}
@@ -489,7 +463,6 @@ static void exit_mm(struct task_struct *tsk)
 {
 	struct mm_struct *mm = tsk->mm;
 	struct core_state *core_state;
-	int mm_released;
 
 	mm_release(tsk, mm);
 	if (!mm)
@@ -536,12 +509,9 @@ static void exit_mm(struct task_struct *tsk)
 	enter_lazy_tlb(mm, current);
 	task_unlock(tsk);
 	mm_update_next_owner(mm);
-
-	mm_released = mmput(mm);
+	mmput(mm);
 	if (test_thread_flag(TIF_MEMDIE))
 		exit_oom_victim();
-	if (mm_released)
-		set_tsk_thread_flag(tsk, TIF_MM_RELEASED);
 }
 
 static struct task_struct *find_alive_thread(struct task_struct *p)
@@ -745,7 +715,6 @@ static void check_stack_usage(void)
 	static DEFINE_SPINLOCK(low_water_lock);
 	static int lowest_to_date = THREAD_SIZE;
 	unsigned long free;
-	int islower = false;
 
 	free = stack_not_used(current);
 
@@ -754,70 +723,21 @@ static void check_stack_usage(void)
 
 	spin_lock(&low_water_lock);
 	if (free < lowest_to_date) {
+		pr_info("%s (%d) used greatest stack depth: %lu bytes left\n",
+			current->comm, task_pid_nr(current), free);
 		lowest_to_date = free;
-		islower = true;
 	}
 	spin_unlock(&low_water_lock);
-
-	if (islower) {
-		pr_info("%s (%d) used greatest stack depth: %lu bytes left\n",
-				current->comm, task_pid_nr(current), free);
-	}
 }
 #else
 static inline void check_stack_usage(void) {}
 #endif
 
-//#ifdef VENDOR_EDIT
-//Haoran.Zhang@PSW.AD.Stability.Crash.1052210, 2016/05/24, Add for debug critical svc crash
-static bool is_zygote_process(struct task_struct *t)
-{
-	const struct cred *tcred = __task_cred(t);
-
-	struct task_struct * first_child = NULL;
-	if(t->children.next && t->children.next != (struct list_head*)&t->children.next)
-		first_child = container_of(t->children.next, struct task_struct, sibling);
-	if(!strcmp(t->comm, "main") && (tcred->uid.val == 0) && (t->parent != 0 && !strcmp(t->parent->comm,"init"))  )
-		return true;
-	else
-		return false;
-	return false;
-}
-
-static bool is_critial_process(struct task_struct *t) {
-    if(t->group_leader && (!strcmp(t->group_leader->comm, "system_server") || is_zygote_process(t) || !strcmp(t->group_leader->comm, "surfaceflinger") || !strcmp(t->group_leader->comm, "servicemanager"))) 
-    {
-       if (t->pid == t->tgid)
-       {
-          return true;
-       }
-       else
-       {
-          return false;
-       }
-    } else {
-        return false;
-    }
-
-}
-//#endif /*VENDOR_EDIT*/
-
 void __noreturn do_exit(long code)
 {
 	struct task_struct *tsk = current;
 	int group_dead;
-#if defined(VENDOR_EDIT) && defined(CONFIG_ELSA_STUB)
-//zhoumingjun@Swdp.shanghai, 2017/04/19, add process_event_notifier support
-	struct process_event_data pe_data;
-#endif
 	TASKS_RCU(int tasks_rcu_i);
-
-//#ifdef VENDOR_EDIT
-//Haoran.Zhang@PSW.AD.Stability.Crash.1052210, 2016/05/24, Add for debug critical svc crash
-    if (is_critial_process(tsk)) {
-        printk("critical svc %d:%s exit with %ld !\n", tsk->pid, tsk->comm,code);
-    }
-//#endif /*VENDOR_EDIT*/
 
 	profile_task_exit(tsk);
 	kcov_task_exit(tsk);
@@ -842,24 +762,12 @@ void __noreturn do_exit(long code)
 
 	validate_creds_for_do_exit(tsk);
 
-#if defined(VENDOR_EDIT) && defined(CONFIG_ELSA_STUB)
-//zhoumingjun@Swdp.shanghai, 2017/04/19, add process_event_notifier support
-	pe_data.pid = tsk->pid;
-	pe_data.uid = tsk->real_cred->uid;
-	pe_data.reason = code;
-	process_event_notifier_call_chain(PROCESS_EVENT_EXIT, &pe_data);
-#endif
-
 	/*
 	 * We're taking recursive faults here in do_exit. Safest is to just
 	 * leave this task alone and wait for reboot.
 	 */
 	if (unlikely(tsk->flags & PF_EXITING)) {
-#ifdef CONFIG_PANIC_ON_RECURSIVE_FAULT
-		panic("Recursive fault!\n");
-#else
 		pr_alert("Fixing recursive fault but reboot is needed!\n");
-#endif
 		/*
 		 * We can do this unlocked here. The futex code uses
 		 * this flag just to verify whether the pi state
@@ -875,10 +783,6 @@ void __noreturn do_exit(long code)
 	}
 
 	exit_signals(tsk);  /* sets PF_EXITING */
-
-	sched_exit(tsk);
-	schedtune_exit_task(tsk);
-
 	/*
 	 * Ensure that all new tsk->pi_lock acquisitions must observe
 	 * PF_EXITING. Serializes against futex.c:attach_to_pi_owner().

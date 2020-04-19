@@ -167,7 +167,6 @@ struct devfreq {
 	struct list_head node;
 
 	struct mutex lock;
-	struct mutex sysfs_lock;
 	struct device dev;
 	struct devfreq_dev_profile *profile;
 	const struct devfreq_governor *governor;
@@ -243,12 +242,6 @@ extern void devm_devfreq_unregister_notifier(struct device *dev,
 extern struct devfreq *devfreq_get_devfreq_by_phandle(struct device *dev,
 						int index);
 
-#ifdef VENDOR_EDIT
-//cuixiaogang@SRC.hypnus.2018-04-05. add support to set devfreq limit
-extern int devfreq_set_limit(struct devfreq *df, unsigned long min, unsigned long max);
-extern int devfreq_get_limit(struct devfreq *df, unsigned long *min, unsigned long *max);
-#endif
-
 /**
  * devfreq_update_stats() - update the last_status pointer in struct devfreq
  * @df:		the devfreq instance whose status needs updating
@@ -272,9 +265,6 @@ static inline int devfreq_update_stats(struct devfreq *df)
  *			the governor may consider slowing the frequency down.
  *			Specify 0 to use the default. Valid value = 0 to 100.
  *			downdifferential < upthreshold must hold.
- * @simple_scaling:	Setting this flag will scale the clocks up only if the
- *			load is above @upthreshold and will scale the clocks
- *			down only if the load is below @downdifferential.
  *
  * If the fed devfreq_simple_ondemand_data pointer is NULL to the governor,
  * the governor uses the default values.
@@ -282,7 +272,6 @@ static inline int devfreq_update_stats(struct devfreq *df)
 struct devfreq_simple_ondemand_data {
 	unsigned int upthreshold;
 	unsigned int downdifferential;
-	unsigned int simple_scaling;
 };
 #endif
 
@@ -424,20 +413,6 @@ static inline int devfreq_update_stats(struct devfreq *df)
 {
 	return -EINVAL;
 }
-
-#ifdef VENDOR_EDIT
-//cuixiaogang@SRC.hypnus.2018-04-05. add support to set devfreq limit
-static inline int devfreq_set_limit(struct devfreq *df, unsigned long min, unsigned long max)
-{
-        return -EINVAL;
-}
-
-static inline int devfreq_get_limit(struct devfreq *df, unsigned long *min, unsigned long *max)
-{
-        return -EINVAL;
-}
-#endif /* VENDOR_EDIT */
-
 #endif /* CONFIG_PM_DEVFREQ */
 
 #endif /* __LINUX_DEVFREQ_H__ */
