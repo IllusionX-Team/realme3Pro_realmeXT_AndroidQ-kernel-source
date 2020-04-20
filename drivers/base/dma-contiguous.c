@@ -168,12 +168,6 @@ int __init dma_contiguous_reserve_area(phys_addr_t size, phys_addr_t base,
 	ret = cma_declare_contiguous(base, size, limit, 0, 0, fixed, res_cma);
 	if (ret)
 		return ret;
-
-	/* Architecture specific contiguous memory fixup. */
-	dma_contiguous_early_fixup(cma_get_base(*res_cma),
-				cma_get_size(*res_cma));
-
-	return 0;
 }
 
 /**
@@ -262,8 +256,6 @@ static int __init rmem_cma_setup(struct reserved_mem *rmem)
 		pr_err("Reserved memory: unable to setup CMA region\n");
 		return err;
 	}
-	/* Architecture specific contiguous memory fixup. */
-	dma_contiguous_early_fixup(rmem->base, rmem->size);
 
 	if (of_get_flat_dt_prop(node, "linux,cma-default", NULL))
 		dma_contiguous_set_default(cma);
